@@ -29,6 +29,7 @@ pub(crate) struct EncodingNames {
     pub(crate) eq_sym_constructor: String,
     pub(crate) congr_constructor: String,
     pub(crate) container_normalize_constructor: String,
+    pub(crate) eval_constructor: String,
     /// For a given function symbol, the name of the function that converts to the AST type.
     pub(crate) sort_to_ast_constructor: HashMap<String, String>,
     pub(crate) fn_to_term_sort: HashMap<String, String>,
@@ -71,6 +72,7 @@ impl EncodingNames {
             eq_sym_constructor: symbol_gen.fresh("Sym"),
             congr_constructor: symbol_gen.fresh("Congr"),
             container_normalize_constructor: symbol_gen.fresh("ContainerNormalize"),
+            eval_constructor: symbol_gen.fresh("Eval"),
             sort_to_ast_constructor: HashMap::default(),
             fn_to_term_sort: HashMap::default(),
             single_parent_ruleset_name: symbol_gen.fresh("single_parent"),
@@ -367,6 +369,7 @@ impl ProofInstrumentor<'_> {
             ref eq_sym_constructor,
             ref congr_constructor,
             ref container_normalize_constructor,
+            ref eval_constructor,
             ref pcons,
             ref pnil,
             ..
@@ -409,6 +412,12 @@ impl ProofInstrumentor<'_> {
 ;; t1 = normalize(c) (the container's canonicalization: sort/dedup for sets,
 ;; last-write-wins for maps, sort for multisets)
 (constructor  {container_normalize_constructor} ({proof_datatype}) {proof_datatype} :internal-hidden)
+
+;; evaluation of a primitive: a reflexive existence proof for each argument and
+;; the result term. Proves r = r for the result r. The primitive is not stored;
+;; it is recovered from the rule body when checking in context (used for
+;; containers built in the query/rule body).
+(constructor  {eval_constructor} ({proof_list_sort} {ast_sort}) {proof_datatype} :internal-hidden)
                 "
         )
     }
@@ -551,7 +560,6 @@ pub(crate) fn command_supports_proof_encoding(
     {
         return Err(ProofEncodingUnsupportedReason::NaiveEqSortPrimitiveFact);
     }
-
     // Check all expressions for primitives without validators
     let mut all_primitives_have_validators = true;
     command.clone().visit_exprs(&mut |expr| {

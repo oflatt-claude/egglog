@@ -448,6 +448,13 @@ pub enum ProofCheckErrorKind {
         proof_rhs: TermId,
         lhs_ok: bool,
     },
+    /// Eval proof: an argument's proof is not a reflexive existence proof
+    #[error("Proof {proof_id}: Eval argument proof is not reflexive, lhs {lhs:?} != rhs {rhs:?}")]
+    EvalArgNotReflexive {
+        proof_id: ProofId,
+        lhs: TermId,
+        rhs: TermId,
+    },
 }
 
 /// Context needed for proof checking
@@ -870,6 +877,27 @@ impl ProofStore {
                     }
                     .into());
                 }
+                Ok(Proposition::new(proof.lhs(), proof.rhs()))
+            }
+
+            Justification::Eval { arg_proofs } => {
+                // Each argument proof must establish that the argument term
+                // exists, i.e. be a reflexive equality `ci = ci`.
+                for &arg_id in arg_proofs {
+                    let prop = self.check_proof_with_context(arg_id, program, ctx)?;
+                    if prop.lhs != prop.rhs {
+                        return Err(ProofCheckErrorKind::EvalArgNotReflexive {
+                            proof_id,
+                            lhs: prop.lhs,
+                            rhs: prop.rhs,
+                        }
+                        .into());
+                    }
+                }
+
+                // The result is verified where this proof is used as a rule-body
+                // premise (the rule check recomputes it with the typed
+                // primitive); standalone we only assert the reflexive proposition.
                 Ok(Proposition::new(proof.lhs(), proof.rhs()))
             }
         };

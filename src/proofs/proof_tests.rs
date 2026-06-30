@@ -237,18 +237,13 @@ mod tests {
             .unwrap();
     }
 
-    // KNOWN GAP: a container's reflexive `<CSort>Proof` is anchored only during
-    // rebuild, not at creation (unlike eq-sort terms). So a rule body that
-    // produces a *newly-created* container via a primitive and needs its proof
-    // in the same iteration fails -- the action lookup of the container's term
-    // proof has no row yet. Contrast
-    // `proof_mode_allows_eq_container_primitive_results_in_facts`, which uses an
-    // already-anchored container. This test pins the current (failing)
-    // behavior; flip it to assert success once the gap is fixed.
+    // A container constructed in the query body and not used in an action: the
+    // binding fact's proof is the container's reflexive `Eval`, which the rule
+    // check re-derives with the typed primitive.
     #[test]
-    fn proof_mode_new_container_primitive_result_in_fact_is_unsupported() {
+    fn proof_mode_query_constructed_container_not_used_in_action() {
         let mut egraph = EGraph::new_with_proofs();
-        let err = egraph
+        egraph
             .parse_and_run_program(
                 None,
                 r#"
@@ -268,12 +263,38 @@ mod tests {
                 (prove (Done))
                 "#,
             )
-            .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("lookup of function"),
-            "expected a container term-proof lookup failure, got: {msg}"
-        );
+            .unwrap();
+    }
+
+    // A container constructed in the query and carried into an action: its body
+    // proof is an `Eval`, and once the action stores it, it is anchored like any
+    // other container, so it rebuilds when its elements are unioned. Exercised
+    // under `proof_testing` (every value's existence is proven).
+    #[test]
+    fn proof_mode_query_constructed_container_used_in_action() {
+        let mut egraph = EGraph::new_with_proofs().with_proof_testing();
+        egraph
+            .parse_and_run_program(
+                None,
+                r#"
+                (datatype E (Mk) (Mk2))
+                (sort EqContainer (Vec E))
+                (relation SeedElem (E))
+                (relation Out (EqContainer))
+                (SeedElem (Mk))
+                (rule ((SeedElem e)
+                       (= xs (vec-of e)))
+                      ((Out xs))
+                      :name "new-container-in-action")
+                (run 1)
+                (check (Out (vec-of (Mk))))
+                ; union an element to force the stored container to rebuild
+                (union (Mk) (Mk2))
+                (run 1)
+                (check (Out (vec-of (Mk2))))
+                "#,
+            )
+            .unwrap();
     }
 
     #[test]

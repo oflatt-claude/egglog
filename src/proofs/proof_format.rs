@@ -73,6 +73,10 @@ enum RawProof {
     /// `t1 = normalize(c)` — the container's canonicalization (reorder/dedup/
     /// merge), which a structural `Congr` chain can't express.
     ContainerNormalize(RawProofId),
+    /// A reflexive existence proof for each argument of a primitive application
+    /// plus the result term `r`, justifying `r = r`. The primitive is not
+    /// recorded; it is recovered from the rule body when checked in context.
+    Eval(Vec<RawProofId>, TermId),
 }
 
 /// A [`ProofStore`] is similar to a [`TermDag`].
@@ -200,6 +204,11 @@ pub enum Justification {
     /// the assumption that normalization preserves the container's value; the
     /// checker recomputes it.
     ContainerNormalize { proof: ProofId },
+    /// Proves `r = r` for a term `r` produced by a primitive applied to
+    /// arguments, each justified by a reflexive existence proof in `arg_proofs`.
+    /// The primitive is not recorded: `r` is re-derived with the typed primitive
+    /// when this proof is checked as a rule-body premise.
+    Eval { arg_proofs: Vec<ProofId> },
 }
 
 impl RawProofStore {
@@ -276,6 +285,10 @@ impl RawProofStore {
             let child_index = self.parse_index(args[1]);
             let child_proof = self.parse_proof(args[2]);
             RawProof::Congr(proof, child_index, child_proof)
+        } else if head == self.names.eval_constructor {
+            assert!(args.len() == 2, "eval constructor should have 2 args");
+            let arg_proofs = self.parse_proof_list(args[0]);
+            RawProof::Eval(arg_proofs, args[1])
         } else {
             panic!("Unrecognized proof term head: {head}. Proof parsing assumes valid proofs.");
         };
@@ -516,6 +529,17 @@ impl ProofStore {
                     justification: Justification::ContainerNormalize { proof: inner_id },
                 }
             }
+            RawProof::Eval(arg_raws, result_raw) => {
+                let arg_proofs: Vec<ProofId> = arg_raws
+                    .iter()
+                    .map(|pid| self.convert_raw_proof(prog, globals, raw_store, *pid))
+                    .collect();
+                let result = raw_store.unwrap_ast(*result_raw);
+                Proof {
+                    proposition: Proposition::new(result, result),
+                    justification: Justification::Eval { arg_proofs },
+                }
+            }
         };
 
         let proof_id = self.id_to_proof.push(proof);
@@ -722,9 +746,8 @@ impl ProofStore {
         dag.to_string_with_let_internal(symbol_gen, proof_term_id, buffer, |constructor| {
             match constructor {
                 "=" => "prop".to_string(),
-                "Fiat" | "Rule" | "Merge" | "Trans" | "Sym" | "Congr" | "ContainerNormalize" => {
-                    "prf".to_string()
-                }
+                "Fiat" | "Rule" | "Merge" | "Trans" | "Sym" | "Congr" | "ContainerNormalize"
+                | "Eval" => "prf".to_string(),
                 _ => "t".to_string(),
             }
         })
@@ -827,6 +850,15 @@ impl ProofStore {
                     "ContainerNormalize".to_string(),
                     vec![equality, inner_term_id],
                 )
+            }
+            Justification::Eval { arg_proofs } => {
+                let equality = make_equality(dag, proof.lhs(), proof.rhs());
+                let arg_terms: Vec<TermId> = arg_proofs
+                    .iter()
+                    .map(|pid| self.proof_to_term_for_printing(dag, *pid, cache))
+                    .collect();
+                let args_term = dag.app("args".to_string(), arg_terms);
+                dag.app("Eval".to_string(), vec![equality, args_term])
             }
         };
 

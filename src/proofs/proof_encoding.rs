@@ -866,13 +866,41 @@ impl<'a> ProofInstrumentor<'a> {
                 }
             }
             ResolvedFact::Eq(_span, left_expr, right_expr) => {
-                let (v1, p1) = self.instrument_fact_expr(left_expr, res, action_lookups);
-                let (v2, p2) = self.instrument_fact_expr(right_expr, res, action_lookups);
-                res.push(format!("(= {v1} {v2})"));
-                let sym = &self.proof_names().eq_sym_constructor;
-                let trans = &self.proof_names().eq_trans_constructor;
+                let is_container_prim = |e: &ResolvedExpr| {
+                    matches!(
+                        e,
+                        ResolvedExpr::Call(_, ResolvedCall::Primitive(p), _)
+                            if p.output().is_eq_container_sort()
+                    )
+                };
+                // A proof-normal-form binding of a fresh variable to a
+                // query-constructed eq-container (`(= xs (vec-of e))`): the two
+                // sides are the same value and the container has no term-proof,
+                // so the fact's proof is just the container's reflexive `Eval`.
+                // Bind the variable to the computed result.
+                let binding = match (left_expr, right_expr) {
+                    (ResolvedExpr::Var(_, v), _) if is_container_prim(right_expr) => {
+                        Some((v.name.clone(), right_expr))
+                    }
+                    (_, ResolvedExpr::Var(_, v)) if is_container_prim(left_expr) => {
+                        Some((v.name.clone(), left_expr))
+                    }
+                    _ => None,
+                };
+                if let Some((var, call_expr)) = binding {
+                    let (fv, eval_proof) =
+                        self.instrument_fact_expr(call_expr, res, action_lookups);
+                    res.push(format!("(= {var} {fv})"));
+                    eval_proof
+                } else {
+                    let (v1, p1) = self.instrument_fact_expr(left_expr, res, action_lookups);
+                    let (v2, p2) = self.instrument_fact_expr(right_expr, res, action_lookups);
+                    res.push(format!("(= {v1} {v2})"));
+                    let sym = &self.proof_names().eq_sym_constructor;
+                    let trans = &self.proof_names().eq_trans_constructor;
 
-                format!("({trans} ({sym} {p1}) {p2})",)
+                    format!("({trans} ({sym} {p1}) {p2})",)
+                }
             }
             ResolvedFact::Fact(generic_expr) => {
                 let (_, proof) = self.instrument_fact_expr(generic_expr, res, action_lookups);
@@ -1001,14 +1029,33 @@ impl<'a> ProofInstrumentor<'a> {
 
                         let proof = if !self.proofs_enabled() {
                             "()".to_string()
-                        } else if specialized_primitive.output().is_eq_sort()
-                            || specialized_primitive.output().is_eq_container_sort()
-                        {
-                            // An eq-sort/eq-container result is an `App`, not a
-                            // literal, so a reflexive `Fiat` would be rejected by
-                            // the checker. Anchor it on the sort's term-proof
-                            // table (the `<CSort>Proof` reflexive proof for
-                            // containers), emitted as an action lookup.
+                        } else if specialized_primitive.output().is_eq_container_sort() {
+                            // A container computed in the query/rule body has no
+                            // anchored term-proof, so justify it with `Eval`: a
+                            // reflexive existence proof for each argument, from
+                            // which the checker recomputes the primitive's
+                            // validator to re-derive the container.
+                            let mut arg_existence_proofs = Vec::with_capacity(args.len());
+                            for (arg, arg_proof) in args.iter().zip(arg_proofs.iter()) {
+                                let p = match arg_proof {
+                                    Some(p) => p.clone(),
+                                    None => self.instrument_fact_expr(arg, res, action_lookups).1,
+                                };
+                                arg_existence_proofs.push(p);
+                            }
+                            let eval = self.proof_names().eval_constructor.clone();
+                            let proof_list = self.format_prooflist(&arg_existence_proofs);
+                            let to_ast = self
+                                .proof_names()
+                                .sort_to_ast_constructor
+                                .get(specialized_primitive.output().name())
+                                .unwrap()
+                                .clone();
+                            format!("({eval} {proof_list} ({to_ast} {fv}))")
+                        } else if specialized_primitive.output().is_eq_sort() {
+                            // An eq-sort (datatype) result is an existing anchored
+                            // term (e.g. an identity primitive returning its
+                            // input); reuse its term-proof, fetched in the action.
                             let term_proof_name =
                                 self.term_proof_name(specialized_primitive.output().name());
                             let fresh_proof = self.fresh_var();

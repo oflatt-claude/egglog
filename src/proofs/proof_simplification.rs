@@ -340,6 +340,17 @@ impl ProofStore {
                     changed = true;
                 }
             }
+            Justification::Eval { arg_proofs } => {
+                // The proposition (result = result) is independent of how the
+                // argument existence proofs are simplified, so only remap them.
+                for pid in arg_proofs.iter_mut() {
+                    let mapped = f(self, *pid);
+                    if mapped != *pid {
+                        *pid = mapped;
+                        changed = true;
+                    }
+                }
+            }
         }
 
         if !changed {
@@ -382,6 +393,8 @@ impl Proof {
             Justification::Trans(_, _) => {}
             Justification::Sym(_) => {}
             Justification::ContainerNormalize { proof: _ } => {}
+            // The only term (the result) lives in the proposition, already mapped.
+            Justification::Eval { arg_proofs: _ } => {}
         }
     }
 }
