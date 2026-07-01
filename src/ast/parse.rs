@@ -111,6 +111,54 @@ fn map_fallible<T>(
         .collect::<Result<_, _>>()
 }
 
+/// The fact-position head that introduces a disjunction in a rule body.
+const OR_HEAD: &str = "OR";
+
+/// Expands the `OR` disjunctions in a rule body into the cartesian product of
+/// branch choices, returning one flat body (a list of fact s-expressions) per
+/// combination.
+///
+/// A disjunction is written `(OR (b1 ...) (b2 ...) ...)`, where each branch
+/// `(bi ...)` is itself a list of facts (a conjunctive subquery). Disjunctions
+/// may be nested inside branches. A body with no `OR` yields a single
+/// combination equal to the original body.
+fn expand_or_body(sexps: &[Sexp]) -> Result<Vec<Vec<&Sexp>>, ParseError> {
+    let mut combos: Vec<Vec<&Sexp>> = vec![vec![]];
+    for sexp in sexps {
+        if let Sexp::List(list, span) = sexp
+            && let [Sexp::Atom(head, _), branches @ ..] = list.as_slice()
+            && head == OR_HEAD
+        {
+            if branches.is_empty() {
+                return error!(span.clone(), "OR requires at least one branch");
+            }
+            // Each branch is a list of facts; expand it (recursively handling
+            // any nested OR) into its own set of combinations.
+            let mut branch_alts: Vec<Vec<&Sexp>> = vec![];
+            for branch in branches {
+                let branch_facts =
+                    branch.expect_list("OR branch (a parenthesized list of facts)")?;
+                branch_alts.extend(expand_or_body(branch_facts)?);
+            }
+            combos = combos
+                .iter()
+                .flat_map(|combo| {
+                    branch_alts.iter().map(move |alt| {
+                        let mut merged = combo.clone();
+                        merged.extend(alt.iter().copied());
+                        merged
+                    })
+                })
+                .collect();
+        } else {
+            for combo in &mut combos {
+                combo.push(sexp);
+            }
+        }
+    }
+    Ok(combos)
+}
+
 pub trait Macro<T>: Send + Sync {
     fn name(&self) -> &str;
     fn parse(&self, args: &[Sexp], span: Span, parser: &mut Parser) -> Result<T, ParseError>;
@@ -467,11 +515,9 @@ impl Parser {
             },
             "rule" => match tail {
                 [lhs, rhs, rest @ ..] => {
-                    let body =
-                        map_fallible(lhs.expect_list("rule query")?, self, Self::parse_fact)?;
-                    let head: Vec<Vec<_>> =
-                        map_fallible(rhs.expect_list("rule actions")?, self, Self::parse_action)?;
-                    let head = GenericActions(head.into_iter().flatten().collect());
+                    // A body may contain `(OR ...)` disjunctions; expand them into
+                    // one conjunctive body per combination of branch choices.
+                    let body_combos = expand_or_body(lhs.expect_list("rule query")?)?;
 
                     let mut ruleset = String::new();
                     let mut name = String::new();
@@ -504,18 +550,43 @@ impl Parser {
                         }
                     }
 
-                    vec![Command::Rule {
-                        rule: Rule {
-                            span,
-                            head,
-                            body,
-                            name,
-                            ruleset,
-                            eval_mode: eval_mode.unwrap_or_default(),
-                            no_decomp,
-                            include_subsumed,
-                        },
-                    }]
+                    let multiple = body_combos.len() > 1;
+                    let mut rules = Vec::with_capacity(body_combos.len());
+                    for (i, combo) in body_combos.iter().enumerate() {
+                        let body = combo
+                            .iter()
+                            .map(|sexp| self.parse_fact(sexp))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        // Actions are re-parsed per branch so any `_` placeholders
+                        // get fresh names that are unique within each rule.
+                        let head: Vec<Vec<_>> = map_fallible(
+                            rhs.expect_list("rule actions")?,
+                            self,
+                            Self::parse_action,
+                        )?;
+                        let head = GenericActions(head.into_iter().flatten().collect());
+                        // Named rules that expand into several rules need distinct
+                        // names; anonymous rules are named later by their (now
+                        // distinct) textual form.
+                        let name = if multiple && !name.is_empty() {
+                            format!("{name}__or{i}")
+                        } else {
+                            name.clone()
+                        };
+                        rules.push(Command::Rule {
+                            rule: Rule {
+                                span: span.clone(),
+                                head,
+                                body,
+                                name,
+                                ruleset: ruleset.clone(),
+                                eval_mode: eval_mode.unwrap_or_default(),
+                                no_decomp,
+                                include_subsumed,
+                            },
+                        });
+                    }
+                    rules
                 }
                 _ => return error!(span, "usage: (rule (<fact>*) (<action>*) <option>*)"),
             },
@@ -766,11 +837,17 @@ impl Parser {
             },
             "fail" => match tail {
                 [subcommand] => {
+                    // A subcommand may expand into several commands (e.g. a rule
+                    // with `OR` branches). Mirroring desugaring of `fail`, run any
+                    // leading commands normally and assert only the last fails.
                     let mut cs = self.parse_command(subcommand)?;
-                    if cs.len() != 1 {
-                        todo!("extend Fail to work with multiple parsed commands")
+                    match cs.pop() {
+                        Some(last) => {
+                            cs.push(Command::Fail(span, Box::new(last)));
+                            cs
+                        }
+                        None => return error!(span, "(fail <command>) requires a command"),
                     }
-                    vec![Command::Fail(span, Box::new(cs.remove(0)))]
                 }
                 _ => return error!(span, "usage: (fail <command>)"),
             },
