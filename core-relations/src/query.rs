@@ -19,6 +19,7 @@ use crate::{
         plan::{JoinHeader, JoinStages, Plan, PlanStrategy},
     },
     pool::{Pooled, with_pool_set},
+    table::SortedWritesTable,
     table_spec::{ColumnId, Constraint},
 };
 
@@ -271,6 +272,68 @@ impl<'outer> RuleSetBuilder<'outer> {
                 .plans
                 .push((plan, cached.desc.clone(), cached.symbol_map.clone())),
         )
+    }
+
+    /// Express a disjunction ("union of subqueries") that produces a common set
+    /// of `output_arity` output columns.
+    ///
+    /// Each entry in `branches` is a closure describing one sub-query: it
+    /// receives a fresh [`QueryBuilder`] (a conjunction of atoms) and must return
+    /// the `output_arity` [`QueryEntry`]s that this branch binds as its output
+    /// tuple. Every branch is compiled to an ordinary rule in this rule set whose
+    /// action inserts its output tuple into a freshly-created ephemeral table,
+    /// which is returned. Because that table has all of its columns as keys,
+    /// identical output tuples (including tuples produced by more than one branch)
+    /// collapse to a single row: the table holds the deduplicated union of the
+    /// branch outputs.
+    ///
+    /// To feed the union into the rest of a query/action, add a normal atom over
+    /// the returned table with `output_arity` variables and attach an action to
+    /// it. Because the union is delivered through a table, callers must run this
+    /// rule set (which populates the table) and call [`Database::merge_all`]
+    /// before a downstream rule scans the returned table.
+    ///
+    /// # Restrictions
+    /// Evaluation is naive/whole-table: every branch is re-evaluated over the
+    /// full contents of its tables each run, with no seminaive/timestamp
+    /// filtering of the union. The union forms the leading part of the overall
+    /// query (its output is a plain table that downstream rules join against).
+    pub fn add_union<F>(&mut self, output_arity: usize, branches: Vec<F>) -> TableId
+    where
+        F: FnOnce(&mut QueryBuilder) -> Vec<QueryEntry>,
+    {
+        // All columns are keys so that the table deduplicates full tuples: an
+        // identical union output produced twice (or by two branches) is a
+        // no-op merge and yields a single row.
+        let dedup_table = SortedWritesTable::new(
+            output_arity,
+            output_arity,
+            None,
+            vec![],
+            Box::new(|_, old, new, _| {
+                debug_assert_eq!(old, new, "union dedup table rows must be fully keyed");
+                false
+            }),
+        );
+        let dst_table = self
+            .db
+            .add_table(dedup_table, std::iter::empty(), std::iter::empty());
+
+        for branch in branches {
+            let mut qb = self.new_rule();
+            let output = branch(&mut qb);
+            assert_eq!(
+                output.len(),
+                output_arity,
+                "union branch must return exactly output_arity ({output_arity}) entries",
+            );
+            let mut rule = qb.build();
+            rule.insert(dst_table, &output)
+                .expect("union output tuple must match the dedup table arity");
+            rule.build();
+        }
+
+        dst_table
     }
 
     /// Build the ruleset.

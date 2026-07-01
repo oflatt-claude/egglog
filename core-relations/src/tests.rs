@@ -10,7 +10,7 @@ use crate::numeric_id::NumericId;
 
 use crate::{
     PlanStrategy,
-    action::WriteVal,
+    action::{ExecutionState, QueryEntry, WriteVal},
     common::Value,
     free_join::{CounterId, Database, TableId},
     make_external_func,
@@ -1281,4 +1281,99 @@ fn early_stop_inner() {
         final_count < 100_000,
         "External function called {final_count} times, should be much less than 10k"
     );
+}
+
+#[test]
+fn union_disjunction() {
+    run_serial_and_parallel(union_disjunction_inner);
+}
+
+/// `R(x) := A(x) OR B(x)`: the union of two single-column relations, deduplicated
+/// on `x`. A value present in both `A` and `B` (here `2` and `3`) must appear
+/// once in the union and fire the downstream action exactly once.
+fn union_disjunction_inner() {
+    let no_merge = || {
+        Box::new(
+            |_: &mut ExecutionState, a: &[Value], b: &[Value], _: &mut Vec<Value>| {
+                assert_eq!(a, b, "merge not supported");
+                false
+            },
+        ) as Box<crate::table::MergeFn>
+    };
+    let mut db = Database::default();
+    let a_impl = SortedWritesTable::new(1, 1, None, vec![], no_merge());
+    let b_impl = SortedWritesTable::new(1, 1, None, vec![], no_merge());
+    // Downstream sink: which x-values the action observed (all columns are keys,
+    // so the sink itself would also dedup, but we assert exact-once via the
+    // reported match count, not the sink contents).
+    let sink_impl = SortedWritesTable::new(1, 1, None, vec![], no_merge());
+
+    let a = db.add_table(a_impl, iter::empty(), iter::empty());
+    let b = db.add_table(b_impl, iter::empty(), iter::empty());
+    let sink = db.add_table(sink_impl, iter::empty(), iter::empty());
+
+    // A = {1, 2, 3}, B = {2, 3, 4}. Union (deduped) = {1, 2, 3, 4}.
+    for x in [1, 2, 3] {
+        db.new_buffer(a).stage_insert(&[Value::new(x)]);
+    }
+    for x in [2, 3, 4] {
+        db.new_buffer(b).stage_insert(&[Value::new(x)]);
+    }
+    db.merge_all();
+
+    // Build the union `A(x) OR B(x)` and get the ephemeral deduped table.
+    let mut rsb = RuleSetBuilder::new(&mut db);
+    let union_table = rsb.add_union(
+        1,
+        vec![
+            Box::new(|qb: &mut crate::query::QueryBuilder| {
+                let x = qb.new_var_named("x");
+                qb.add_atom(a, &[x.into()], &[]).unwrap();
+                vec![x.into()]
+            }) as Box<dyn FnOnce(&mut crate::query::QueryBuilder) -> Vec<QueryEntry>>,
+            Box::new(|qb: &mut crate::query::QueryBuilder| {
+                let x = qb.new_var_named("x");
+                qb.add_atom(b, &[x.into()], &[]).unwrap();
+                vec![x.into()]
+            }),
+        ],
+    );
+    let union_rules = rsb.build();
+    db.run_rule_set(&union_rules, ReportLevel::TimeOnly);
+    // Deduplication of the union happens when the ephemeral table is merged.
+    db.merge_all();
+
+    // The ephemeral union table holds exactly the deduplicated union of A and B.
+    let union_scan = db.get_table(union_table);
+    let all = union_scan.all();
+    let mut got = Vec::from_iter(
+        union_scan
+            .scan(all.as_ref())
+            .iter()
+            .map(|(_, row)| row.to_vec()),
+    );
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::new(1)],
+            vec![Value::new(2)],
+            vec![Value::new(3)],
+            vec![Value::new(4)],
+        ],
+    );
+
+    // Feed each distinct union tuple to a downstream action, and assert it fires
+    // exactly once per distinct tuple (4 times), not once per (branch, tuple).
+    let mut rsb = RuleSetBuilder::new(&mut db);
+    let mut query = rsb.new_rule();
+    let x = query.new_var_named("x");
+    query.add_atom(union_table, &[x.into()], &[]).unwrap();
+    let mut rule = query.build();
+    rule.insert(sink, &[x.into()]).unwrap();
+    rule.build_with_description("downstream");
+    let downstream = rsb.build();
+
+    let report = db.run_rule_set(&downstream, ReportLevel::TimeOnly);
+    assert_eq!(report.num_matches("downstream"), 4, "{report:?}");
 }
