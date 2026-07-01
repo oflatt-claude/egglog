@@ -1,10 +1,11 @@
 # Disjunction (`OR`) in egglog rule bodies
 
-Status: **prototype implemented** (parse-time distribution) + design for efficient
-backend execution.
+Status: on this branch, **Strategy B (materialized union) is implemented**
+(`src/ast/disjunction.rs`). Strategy A (rule-splitting) is the reference semantics;
+Strategy C (native union node) is a separate branch. See §4 for the comparison.
 
-This document explores adding disjunction to rule queries: syntax, semantics, the
-current prototype, and how to execute it efficiently in the backend.
+This document covers the syntax, semantics, and the strategies for executing
+disjunction efficiently in the backend.
 
 ## 1. Syntax
 
@@ -160,7 +161,17 @@ There are three implementation levels, in increasing order of backend intrusion.
 Frontend-only, described in §3. Correct, seminaive-friendly, zero backend change.
 Best baseline; suffers blowup and redundant firing.
 
-### Strategy B — materialized union subquery (recommended next step)
+### Strategy B — materialized union subquery (implemented on this branch)
+
+Implemented in `src/ast/disjunction.rs` at the egglog level (no `core-relations`
+changes): each `OR` is lowered to an internal relation `R_or(V)` keyed on the common
+variables `V`, one auxiliary rule per branch inserts `V` into `R_or`, and the `OR` in
+the body is replaced by the atom `R_or(V)`. Nested/multiple `OR`s are handled
+bottom-up; a branch-local variable used outside its `OR` is a compile error. Because
+`R_or` is a real relation maintained by rules, it reuses seminaive evaluation and the
+worst-case-optimal join unchanged — at the cost of one extra derivation step of
+latency, so rules must be run to a fixpoint. The description below is the general
+form; the alternative deeper integration is Strategy C.
 
 Compile `R_or` to a **materialized intermediate relation** and give the outer query a
 single atom over it. This is precisely what the planner already does for hypertree

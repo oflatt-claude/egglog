@@ -1947,7 +1947,21 @@ impl EGraph {
         &mut self,
         command: Command,
     ) -> Result<Vec<ResolvedNCommand>, Error> {
-        let desugared = desugar_command(command, &mut self.parser, self.proof_state.proof_testing)?;
+        // Lower `OR` disjunctions to materialized-union relations + auxiliary rules
+        // before desugaring, so the rest of the pipeline only sees ordinary rules.
+        let lowered = crate::ast::disjunction::lower_disjunctions(
+            &self.type_info,
+            &mut self.parser.symbol_gen,
+            command,
+        )?;
+        let mut desugared = Vec::new();
+        for command in lowered {
+            desugared.extend(desugar_command(
+                command,
+                &mut self.parser,
+                self.proof_state.proof_testing,
+            )?);
+        }
         if let Some(original_typechecking) = self.proof_state.original_typechecking.as_mut() {
             // Typecheck using the original egraph
             // TODO this is ugly- we don't need an entire e-graph just for type information.

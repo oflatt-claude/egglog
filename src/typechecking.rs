@@ -1148,6 +1148,12 @@ pub enum TypeError {
     #[error("{1}\nUnbound symbol {0}")]
     Unbound(String, Span),
     #[error(
+        "{1}\nVariable {0} is local to one branch of an OR but is used outside it; only variables common to all branches may cross the OR boundary"
+    )]
+    OrBranchLocalEscapes(String, Span),
+    #[error("{0}\nEach OR branch must contain at least one fact")]
+    EmptyOrBranch(Span),
+    #[error(
         "{1}\nVariable {0} is ungrounded. A variable is grounded when it appears as an argument to a constructor or function in the query, not just under primitives or equalities."
     )]
     Ungrounded(String, Span),

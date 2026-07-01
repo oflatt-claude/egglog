@@ -794,6 +794,9 @@ impl<'a> ProofInstrumentor<'a> {
                 let (_, proof) = self.instrument_fact_expr(generic_expr, res, action_lookups);
                 proof
             }
+            ResolvedFact::Or(..) => {
+                unreachable!("OR facts are lowered away before typechecking")
+            }
         }
     }
 

@@ -1,5 +1,6 @@
 pub mod check_shadowing;
 pub mod desugar;
+pub(crate) mod disjunction;
 mod expr;
 mod parse;
 pub mod proof_global_remover;
@@ -1426,6 +1427,9 @@ where
                     let (child_atoms, expr) = expr.to_query(typeinfo, fresh_gen);
                     atoms.extend(child_atoms);
                     new_body.push(GenericFact::Fact(expr));
+                }
+                GenericFact::Or(..) => {
+                    unreachable!("OR facts are lowered away before typechecking")
                 }
             }
         }

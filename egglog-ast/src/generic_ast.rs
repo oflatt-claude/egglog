@@ -35,6 +35,10 @@ pub enum GenericExpr<Head, Leaf> {
 pub enum GenericFact<Head, Leaf> {
     Eq(Span, GenericExpr<Head, Leaf>, GenericExpr<Head, Leaf>),
     Fact(GenericExpr<Head, Leaf>),
+    /// A disjunction of sub-queries. Each branch is a conjunction of facts;
+    /// the disjunction matches when any branch matches. Only variables that
+    /// appear in every branch may be used outside the disjunction.
+    Or(Span, Vec<Vec<GenericFact<Head, Leaf>>>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

@@ -970,6 +970,9 @@ impl ProofStore {
 
                 Ok(())
             }
+            ResolvedFact::Or(..) => {
+                unreachable!("OR facts are lowered away before typechecking")
+            }
         }
     }
 

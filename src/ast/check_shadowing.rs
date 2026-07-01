@@ -112,6 +112,9 @@ impl Names {
                     collect_expr_names(e2, &mut collected);
                 }
                 ResolvedFact::Fact(e) => collect_expr_names(e, &mut collected),
+                ResolvedFact::Or(..) => {
+                    unreachable!("OR facts are lowered away before typechecking")
+                }
             }
         }
 
