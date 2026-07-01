@@ -1,6 +1,5 @@
 pub mod check_shadowing;
 pub mod desugar;
-pub(crate) mod disjunction;
 mod expr;
 mod parse;
 pub mod proof_global_remover;
