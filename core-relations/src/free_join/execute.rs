@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     common::{HashMap, IndexMap},
-    free_join::plan::{JoinStages, MatId, MatScanMode, MatSpec},
+    free_join::plan::{JoinStages, MatId, MatScanMode, MatSpec, UnionPlan},
     numeric_id::{DenseIdMap, IdVec, NumericId},
     query::Atom,
     row_buffer::{RowBuffer, SmallValueVec},
@@ -477,6 +477,13 @@ impl Database {
                                         &mut action_buf,
                                     );
                                 }
+                                Plan::UnionPlan(plan) => {
+                                    join_state.run_union_plan_serial(
+                                        plan,
+                                        &mut binding_info,
+                                        &mut action_buf,
+                                    );
+                                }
                             }
                         }
                         let search_and_apply_time = search_and_apply_timer.elapsed();
@@ -587,6 +594,13 @@ impl Database {
                                 &plan.result_block,
                                 &plan.atoms,
                                 plan.actions,
+                                &mut binding_info,
+                                &mut action_buf,
+                            );
+                        }
+                        Plan::UnionPlan(plan) => {
+                            join_state.run_union_plan_serial(
+                                plan,
                                 &mut binding_info,
                                 &mut action_buf,
                             );
@@ -929,6 +943,99 @@ impl<'a> JoinState<'a> {
             &mut order,
             &mut leaf_scans,
             0,
+            binding_info,
+            action_buf,
+        );
+    }
+
+    /// Execute a [`UnionPlan`]: materialize each disjunction, then run the
+    /// surrounding conjunction against those materializations.
+    ///
+    /// The union materializations and body bags are always computed serially here
+    /// (naive whole-table evaluation); only the final `result_block` uses the
+    /// caller's `action_buf`, so it participates in whatever parallelism the
+    /// caller set up.
+    fn run_union_plan_serial<'buf, BUF: ActionBuffer<'buf, ActionId>>(
+        &self,
+        plan: &'buf UnionPlan,
+        binding_info: &mut BindingInfo,
+        action_buf: &mut BUF,
+    ) where
+        'a: 'buf,
+    {
+        let union_count = plan.union_mats.len();
+        let n_blocks = union_count + plan.body_blocks.len();
+
+        // `MatSpec` for every block, in `MatId` order: union mats first (message
+        // vars = shared vars, no value vars), then the body bags.
+        let mut specs: DenseIdMap<MatId, MatSpec> = DenseIdMap::with_capacity(n_blocks);
+        for (i, u) in plan.union_mats.iter().enumerate() {
+            specs.insert(
+                MatId::from_usize(i),
+                MatSpec {
+                    msg_vars: u.msg_vars.clone(),
+                    val_vars: SmallVec::new(),
+                },
+            );
+        }
+        for (j, (_stages, mat_spec)) in plan.body_blocks.iter().enumerate() {
+            specs.insert(MatId::from_usize(union_count + j), mat_spec.clone());
+        }
+
+        // Materialize each union: run every branch into the same materialization,
+        // then dedup so each key of shared variables appears exactly once (a
+        // union is a set).
+        for (i, u) in plan.union_mats.iter().enumerate() {
+            let mat_id = MatId::from_usize(i);
+            let mut materializations = DenseIdMap::with_capacity(1);
+            materializations.insert(mat_id, IndexMap::<Vec<Value>, RowBuffer>::default());
+            let mut materializer = InPlaceMaterializer {
+                specs: &specs,
+                materializations,
+                scratch_key: Default::default(),
+                scratch_val: Default::default(),
+            };
+            for branch in &u.branches {
+                self.run_join_stages(branch, &plan.atoms, mat_id, binding_info, &mut materializer);
+            }
+            let mut mat = materializer.materializations.take(mat_id).unwrap();
+            // A union with no satisfying branch prunes the whole match.
+            if mat.is_empty() {
+                return;
+            }
+            dedup_union_mat(&mut mat);
+            binding_info.materializations.insert(mat_id, Arc::new(mat));
+        }
+
+        // Run the surrounding conjunction's bags, materializing each in turn.
+        {
+            let mut materializations = DenseIdMap::with_capacity(plan.body_blocks.len());
+            for j in 0..plan.body_blocks.len() {
+                materializations.insert(MatId::from_usize(union_count + j), Default::default());
+            }
+            let mut materializer = InPlaceMaterializer {
+                specs: &specs,
+                materializations,
+                scratch_key: Default::default(),
+                scratch_val: Default::default(),
+            };
+            for (j, (stages, _mat_spec)) in plan.body_blocks.iter().enumerate() {
+                let mat_id = MatId::from_usize(union_count + j);
+                self.run_join_stages(stages, &plan.atoms, mat_id, binding_info, &mut materializer);
+                if materializer.materializations[mat_id].is_empty() {
+                    return;
+                }
+                binding_info.materializations.insert(
+                    mat_id,
+                    Arc::new(materializer.materializations.take(mat_id).unwrap()),
+                );
+            }
+        }
+
+        self.run_join_stages(
+            &plan.result_block,
+            &plan.atoms,
+            plan.actions,
             binding_info,
             action_buf,
         );
@@ -2104,6 +2211,22 @@ fn flush_action_states(
             bindings.clear();
             match_counter.inc_matches(action, succeeded);
             *len = 0;
+        }
+    }
+}
+
+/// Collapse a union materialization so each key holds a single (stale) row.
+///
+/// Union bags have no value variables, so a materialization key's value rows are
+/// all the same stale placeholder; several branches producing the same key of
+/// shared variables would otherwise leave duplicate rows and make the downstream
+/// join fire once per duplicate. Deduping makes the union behave as a set.
+fn dedup_union_mat(mat: &mut IndexMap<Vec<Value>, RowBuffer>) {
+    for (_key, buffer) in mat.iter_mut() {
+        if buffer.len() > 1 {
+            let mut fresh = RowBuffer::new(1);
+            fresh.add_row(&[Value::stale()]);
+            *buffer = fresh;
         }
     }
 }

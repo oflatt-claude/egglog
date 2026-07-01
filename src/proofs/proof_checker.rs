@@ -971,7 +971,7 @@ impl ProofStore {
                 Ok(())
             }
             ResolvedFact::Or(..) => {
-                unreachable!("OR facts are lowered away before typechecking")
+                unreachable!("OR disjunctions are rejected when proofs/term encoding are enabled")
             }
         }
     }

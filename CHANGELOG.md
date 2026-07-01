@@ -2,7 +2,7 @@
 
 ## [Unreleased] - ReleaseDate
 
-- **Disjunction (`OR`) in rule bodies.** A rule query may contain `(OR (branch) (branch) ...)`, where each branch is a parenthesized list of facts (a conjunctive subquery); the rule matches when any branch matches. Only variables common to every branch may be used outside the disjunction. See `docs/disjunction-design.md`.
+- **Disjunction (`OR`) in rule bodies.** A rule query may contain `(OR (branch) (branch) ...)`, where each branch is a parenthesized list of facts (a conjunctive subquery); the rule matches when any branch matches. Only variables common to every branch may be used outside the disjunction. Each `OR` is compiled in the `core-relations` query planner (Strategy B): the union of the branches' projections onto their common variables is materialized as a leading bag, and the rest of the query joins against it via the existing tree-decomposition machinery — no extra egglog relations or rules. Unions run naively (no seminaive delta through the disjunction) and are unsupported under proofs/term encoding. See `docs/disjunction-design.md`.
 - Add typed `EGraph` extension state that clones with `EGraph` and is restored by `push`/`pop`.
 - Report full source file paths in egglog span and error messages.
 - Fix seminaive matching after nested containers rebuild in place by propagating dirty container ids through parent containers.

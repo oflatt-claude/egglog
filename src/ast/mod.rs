@@ -1428,7 +1428,10 @@ where
                     new_body.push(GenericFact::Fact(expr));
                 }
                 GenericFact::Or(..) => {
-                    unreachable!("OR facts are lowered away before typechecking")
+                    // Disjunctions contribute no conjunctive atoms; they are
+                    // lowered separately (as a materialized union in the backend).
+                    // The variables shared by every branch are exposed via a
+                    // dedicated union atom rather than through this flat query.
                 }
             }
         }

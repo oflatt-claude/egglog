@@ -97,6 +97,15 @@ impl<T: Fn(&mut Bindings, &mut CoreRuleBuilder) -> Result<()> + Clone + Send + S
 dyn_clone::clone_trait_object!(Brc);
 type BuildRuleCallback = Box<dyn Brc>;
 
+/// A disjunction (`OR`) recorded on a [`Query`]. `branches` holds, per branch,
+/// the indices into `Query::atoms` of that branch's table atoms; `output_vars`
+/// are the variables shared by every branch (the ones visible outside the `OR`).
+#[derive(Clone)]
+struct BridgeUnion {
+    output_vars: Vec<VariableId>,
+    branches: Vec<Vec<AtomId>>,
+}
+
 #[derive(Clone)]
 pub(crate) struct Query {
     uf_table: TableId,
@@ -112,6 +121,10 @@ pub(crate) struct Query {
     /// looks like the high-level rule, passing along an environment that keeps
     /// track of the mappings between low and high-level variables.
     add_rule: Vec<BuildRuleCallback>,
+    /// Disjunctions (`OR`) in the query. Each entry records the branches (as
+    /// lists of indices into `atoms`) and the shared output variables. See
+    /// [`RuleBuilder::query_union`].
+    unions: Vec<BridgeUnion>,
     /// If set, execute a single rule (rather than O(atoms.len()) rules) during
     /// seminaive, with the given atom as the focus.
     sole_focus: Option<usize>,
@@ -149,6 +162,7 @@ impl EGraph {
                 vars: Default::default(),
                 atoms: Default::default(),
                 add_rule: Default::default(),
+                unions: Default::default(),
                 plan_strategy: Default::default(),
                 no_decomp: false,
             },
@@ -469,6 +483,36 @@ impl RuleBuilder<'_> {
         Ok(())
     }
 
+    /// Register a disjunction (`OR`) in the query.
+    ///
+    /// Each branch is the list of table-atom [`AtomId`]s (as returned by
+    /// [`query_table`](Self::query_table)) of a conjunctive subquery. The query
+    /// matches when any branch matches, and only `output_vars` — the variables
+    /// shared by every branch — are visible to the rest of the query and the
+    /// actions.
+    ///
+    /// Unions are evaluated naively (whole-table, no seminaive delta), so adding
+    /// one opts the whole rule out of seminaive evaluation.
+    ///
+    /// Branches may only contain table atoms (added with `query_table`), not
+    /// primitives.
+    pub fn query_union(&mut self, output_vars: &[QueryEntry], branches: Vec<Vec<AtomId>>) {
+        let output_vars = output_vars
+            .iter()
+            .map(|entry| match entry {
+                QueryEntry::Var(Variable { id, .. }) => *id,
+                QueryEntry::Const { .. } => {
+                    panic!("query_union output variables must be variables, not constants")
+                }
+            })
+            .collect();
+        self.query.seminaive = false;
+        self.query.unions.push(BridgeUnion {
+            output_vars,
+            branches,
+        });
+    }
+
     /// Subsume the given entry in `func`.
     ///
     /// `entries` should match the number of keys to the function.
@@ -763,6 +807,29 @@ impl Query {
         let mut atom_mapping = Vec::with_capacity(self.atoms.len());
         for (table, entries, _schema_info) in &self.atoms {
             atom_mapping.push(add_atom(&mut qb, *table, entries, &[], &mut inner)?);
+        }
+        for union in &self.unions {
+            let output_vars: Vec<core_relations::Variable> = union
+                .output_vars
+                .iter()
+                .map(|v| match inner.mapping[*v] {
+                    DstVar::Var(var) => var,
+                    DstVar::Const(_) => {
+                        unreachable!("union output variables are always variables")
+                    }
+                })
+                .collect();
+            let branches: Vec<Vec<core_relations::AtomId>> = union
+                .branches
+                .iter()
+                .map(|branch| {
+                    branch
+                        .iter()
+                        .map(|bridge_atom| atom_mapping[bridge_atom.index()])
+                        .collect()
+                })
+                .collect();
+            qb.add_union(&output_vars, branches);
         }
         let rule_id = self.run_rules_and_build(qb, inner, desc)?;
         let rs = rsb.build();

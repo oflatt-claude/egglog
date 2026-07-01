@@ -1087,6 +1087,7 @@ pub(crate) trait GenericRuleExt<Head, Leaf> {
         typeinfo: &TypeInfo,
         fresh_gen: &mut impl FreshGen<Head, Leaf>,
         union_to_set_optimization: bool,
+        extra_bound: &[Leaf],
     ) -> Result<GenericCoreRule<HeadOrEq<Head>, Head, Leaf>, TypeError>
     where
         Head: Clone + Display + IsFunc,
@@ -1098,11 +1099,16 @@ where
     Head: Clone + Display + IsFunc,
     Leaf: Clone + PartialEq + Eq + Display + Hash + Debug,
 {
+    /// `extra_bound` names variables that are bound by the query even though they
+    /// do not appear in the flat conjunctive body — e.g. the variables shared by
+    /// the branches of an `OR`, which are bound by the union materialization.
+    /// They are added to the action binding so actions may reference them.
     fn to_core_rule(
         &self,
         typeinfo: &TypeInfo,
         fresh_gen: &mut impl FreshGen<Head, Leaf>,
         union_to_set_optimization: bool,
+        extra_bound: &[Leaf],
     ) -> Result<GenericCoreRule<HeadOrEq<Head>, Head, Leaf>, TypeError>
     where
         Head: Clone + Display + IsFunc,
@@ -1110,6 +1116,9 @@ where
     {
         let (body, _correspondence) = Facts(self.body.clone()).to_query(typeinfo, fresh_gen);
         let mut binding = body.get_vars();
+        for var in extra_bound {
+            binding.insert(var.clone());
+        }
         let mut ctx =
             CoreActionContext::new(typeinfo, &mut binding, fresh_gen, union_to_set_optimization);
         let (head, _correspondence) = self.head.to_core_actions(&mut ctx)?;
@@ -1127,15 +1136,20 @@ pub(crate) trait ResolvedRuleExt {
         typeinfo: &TypeInfo,
         fresh_gen: &mut SymbolGen,
         union_to_set_optimization: bool,
+        extra_bound: &[ResolvedVar],
     ) -> Result<ResolvedCoreRule, TypeError>;
 }
 
 impl ResolvedRuleExt for ResolvedRule {
+    /// `extra_bound` is forwarded to [`to_core_rule`](GenericRuleExt::to_core_rule):
+    /// variables bound by the query but absent from the flat body (the shared
+    /// variables of an `OR`).
     fn to_canonicalized_core_rule(
         &self,
         typeinfo: &TypeInfo,
         fresh_gen: &mut SymbolGen,
         union_to_set_optimization: bool,
+        extra_bound: &[ResolvedVar],
     ) -> Result<ResolvedCoreRule, TypeError> {
         let value_eq = &typeinfo.get_prims("value-eq").unwrap()[0];
         let value_eq = |at1: &ResolvedAtomTerm, at2: &ResolvedAtomTerm| {
@@ -1146,7 +1160,8 @@ impl ResolvedRuleExt for ResolvedRule {
             })
         };
 
-        let rule = self.to_core_rule(typeinfo, fresh_gen, union_to_set_optimization)?;
+        let rule =
+            self.to_core_rule(typeinfo, fresh_gen, union_to_set_optimization, extra_bound)?;
 
         // The groundedness check happens before canonicalization, because canonicalization
         // may turn ungrounded variables in a query to unbounded variables in actions (e.g.,

@@ -1,8 +1,10 @@
 # Disjunction (`OR`) in egglog rule bodies
 
-Status: on this branch, **Strategy B (materialized union) is implemented**
-(`src/ast/disjunction.rs`). Strategy A (rule-splitting) is the reference semantics;
-Strategy C (native union node) is a separate branch. See §4 for the comparison.
+Status: **Strategy B (materialized union) is implemented in the `core-relations`
+query planner** — the disjunction is materialized as a bag inside the
+tree-decomposed plan, not rewritten into egglog relations/rules. Strategy A
+(rule-splitting) is the reference semantics; Strategy C (native streaming union
+node) is future work. See §4 for the comparison.
 
 This document covers the syntax, semantics, and the strategies for executing
 disjunction efficiently in the backend.
@@ -87,7 +89,12 @@ common variables the two firings perform *identical* work. Disjunction is theref
 sound regardless of how many branches match; the only question is how much redundant
 work an implementation does (see §4).
 
-## 3. Current implementation: parse-time distribution
+## 3. Reference semantics: parse-time distribution (Strategy A)
+
+The following describes the rule-splitting strategy, which is the *reference
+semantics* any backend implementation must match, not the current backend (which
+is Strategy B, §4).
+
 
 Disjunction distributes over conjunction:
 
@@ -95,39 +102,12 @@ Disjunction distributes over conjunction:
 C ∧ (D₁ ∨ ... ∨ Dₙ)   ≡   (C ∧ D₁) ∨ ... ∨ (C ∧ Dₙ)
 ```
 
-and a disjunction of rule bodies is exactly a set of rules. So the prototype expands
-a body into the **cartesian product** of its branch choices at parse time, emitting
-one ordinary rule per combination. With `k` disjunctions of sizes `m₁..mₖ`, it emits
-`∏ mᵢ` rules.
-
-Implementation (`src/ast/parse.rs`):
-
-- `expand_or_body` walks the raw body s-expressions and returns one flat body per
-  combination (recursively handling nested `OR`). A body with no `OR` yields exactly
-  one combination, so non-disjunctive rules are unaffected.
-- The `"rule"` command arm parses each combination into its own `Rule`. The command
-  parser already returns `Vec<Command>`, so no new machinery is needed. Anonymous
-  rules are named by their textual form (`src/ast/desugar.rs:434`), which differs per
-  combination; explicitly named rules get a `__or<i>` suffix.
-- The `"fail"` command arm now tolerates a sub-command that expands to several
-  commands (previously a `todo!()`), mirroring how desugaring already handles
-  `fail` (`src/ast/desugar.rs:188`).
-
-Everything downstream — typechecking, canonicalization to `CoreRule`
-(`src/core.rs`), the bridge (`egglog-bridge`), and execution (`core-relations`) — is
-untouched: it only ever sees ordinary conjunctive rules.
-
-### Why this is correct and complete
-
-- **Semantics:** distribution is the textbook meaning of a disjunctive body.
-- **The common-variable rule is enforced for free.** If an action uses a variable
-  bound in only some branches, the product rule that chose a branch *without* that
-  variable fails egglog's existing unbound-variable check (`typechecking.rs`), so the
-  whole rule is rejected. (The error message names the offending variable but not the
-  `OR` — see §6.)
-- **Seminaive evaluation composes.** Each product rule is a normal rule and is run
-  incrementally by the existing seminaive machinery
-  (`egglog-bridge/src/rule.rs`, `add_rules_from_cached`).
+and a disjunction of rule bodies is exactly a set of rules: distributing a body
+into the **cartesian product** of its branch choices yields one ordinary rule per
+combination (`∏ mᵢ` rules for `k` disjunctions of sizes `m₁..mₖ`). This is the
+textbook meaning of a disjunctive body and the semantics the backend (§4) must
+match; it composes with seminaive and proofs because every product rule is an
+ordinary conjunctive rule.
 
 ### Limitations
 
@@ -161,125 +141,119 @@ There are three implementation levels, in increasing order of backend intrusion.
 Frontend-only, described in §3. Correct, seminaive-friendly, zero backend change.
 Best baseline; suffers blowup and redundant firing.
 
-### Strategy B — materialized union subquery (implemented on this branch)
+### Strategy B — materialized union in the query planner (implemented)
 
-Implemented in `src/ast/disjunction.rs` at the egglog level (no `core-relations`
-changes): each `OR` is lowered to an internal relation `R_or(V)` keyed on the common
-variables `V`, one auxiliary rule per branch inserts `V` into `R_or`, and the `OR` in
-the body is replaced by the atom `R_or(V)`. Nested/multiple `OR`s are handled
-bottom-up; a branch-local variable used outside its `OR` is a compile error. Because
-`R_or` is a real relation maintained by rules, it reuses seminaive evaluation and the
-worst-case-optimal join unchanged — at the cost of one extra derivation step of
-latency, so rules must be run to a fixpoint. The description below is the general
-form; the alternative deeper integration is Strategy C.
+This is what the codebase does today. An `OR` is materialized as a **bag inside the
+tree-decomposed plan** in `core-relations`; there are **no** egglog-level relations
+or auxiliary rules. The union relation `R_or(V) = ⋃ᵢ π_V(Dᵢ)` is a materialization
+keyed on the common variables `V`, computed once, and the rest of the query joins
+against it using the *same* materialization machinery the planner already uses for
+hypertree decomposition (Yannakakis): a bag materialized on its *message variables*,
+which its parent joins against to prune its search
+(`core-relations/src/free_join/plan.rs` module doc; `DecomposedPlan`, `MatSpec`,
+`MatId`/`MatScanMode`, `JoinStage::FusedIntersectMat`).
 
-Compile `R_or` to a **materialized intermediate relation** and give the outer query a
-single atom over it. This is precisely what the planner already does for hypertree
-decomposition (Yannakakis): `core-relations` breaks a query into *bags*, materializes
-a bag keyed on the *message variables* it shares with its parent, and the parent joins
-against that materialization to prune its search
-(`core-relations/src/free_join/plan.rs:6-25`, `DecomposedPlan` at line 284,
-`MatId`/`MatScanMode` at 83-91).
+#### The pipeline, end to end
 
-An `OR` maps onto this almost directly:
-
-- Treat each branch `Dᵢ` as a bag whose message variables are `V`.
-- Instead of one materialization per bag feeding a parent, **union** the `π_V(Dᵢ)`
-  materializations into one relation `R_or` keyed on `V`.
-- The outer query gets a synthetic atom `R_or(V)` and is planned normally.
-
-Where it plugs in:
-
-- Bridge: extend the query builder (`egglog-bridge/src/rule.rs`, `Query.atoms` and
-  `query_table`/`query_prim`) with a "union atom" that carries a list of branch
-  sub-queries and their shared columns `V`.
-- Planner: lower the union atom to N branch plans plus a union-into-`R_or` step,
-  reusing the existing bag-materialization code path in `plan.rs`, then expose `R_or`
-  as an ordinary scannable atom to the outer plan.
+- **Typechecking** (`src/typechecking.rs`, `typecheck_rule_with_or`). The body is
+  split into its conjunctive facts and its `OR`s. Nested `OR`s are flattened to a flat
+  list of conjunctive branches (DNF, `flatten_or_branches`). The conjunctive facts and
+  every branch are added to a single constraint `Problem` — with each branch's
+  *branch-local* variables renamed fresh so distinct branches never collide, while the
+  common variables keep their names and unify to one sort. The interface rule (only a
+  disjunction's common variables may be used outside it) is enforced on the original
+  names (`OrBranchLocalEscapes`). The result carries each disjunction as a
+  `ResolvedFact::Or`.
+- **Frontend → backend** (`src/lib.rs`, `add_rule` / `lower_or_groups` / `BackendRule`).
+  `OR`s are pulled out of the flat core query (`Facts::to_query` skips them); each
+  branch is lowered to a canonicalized core query, and its common variables are passed
+  as `extra_bound` so the actions may reference them. `BackendRule::unions` emits each
+  branch's table atoms and then a single `RuleBuilder::query_union(output_vars, branches)`.
+- **Bridge** (`egglog-bridge/src/rule.rs`). `query_union` records the branches (as
+  indices into the query's atoms) and the shared `output_vars`. Adding a union forces
+  the whole rule out of seminaive. `build_cached_plan` translates the branch atom
+  indices to `core-relations` `AtomId`s and calls `QueryBuilder::add_union`.
+- **Planner** (`core-relations/src/free_join/plan.rs`, `plan_union_query`). Each
+  branch is planned (over its own atoms) into `JoinStages` that project onto `V`. Each
+  `OR` becomes a leading materialization bag (`UnionMat`, `MatSpec { msg_vars: V,
+  val_vars: [] }`); the surrounding conjunction is planned as an ordinary bag that
+  joins against those materializations via `plan_single_bag`'s prologue
+  (`FusedIntersectMat`), reusing the decomposition path. `build_union_result_block`
+  gathers the final bindings. The result is a `Plan::UnionPlan`.
+- **Executor** (`core-relations/src/free_join/execute.rs`, `run_union_plan_serial`).
+  Each union's branches are run into one materialization (keyed on `V`) and deduped so
+  each `V`-tuple appears once (a set); then the body bags run, then the result block
+  fires the actions.
 
 Benefits: no rule blowup (each branch planned once), automatic dedup (the union is a
-set, so no redundant firing), and the outer conjunction is planned once.
+set — no redundant firing), and the surrounding conjunction is planned and evaluated
+once.
 
-**The hard part — seminaive maintenance.** Rules run to fixpoint and seminaive only
-considers *new* tuples each iteration. A materialized `R_or` must therefore be
-maintained incrementally: a tuple in `R_or` is "new" this iteration if it is produced
-by a branch from at least one new input tuple. The existing seminaive scheme
-(`egglog-bridge/src/rule.rs`, `add_rules_from_cached`) builds, for an N-atom query, N
-variants that each force one atom to the new-tuple delta. The analogous rule for a
-union atom is a union over branches of a union over each branch's atoms — i.e. `R_or`'s
-delta is `⋃ᵢ (delta of branch Dᵢ)`. Two viable designs:
+#### Restrictions of the current implementation
 
-- *Delta materialization:* recompute only the branch deltas each iteration and union
-  them into `R_or`; treat `R_or`'s own new rows as the delta for the outer join. This
-  keeps full incrementality but requires the union atom to participate in the
-  seminaive variant expansion.
-- *Recompute-per-iteration:* rematerialize `R_or` fully each iteration and diff. Much
-  simpler, loses incrementality for the disjunctive part; acceptable when branches are
-  cheap or the disjunction is small.
+- **Naive, whole-table evaluation.** Unions are recomputed in full; there is no
+  seminaive delta *through* a disjunction (adding a union opts the rule out of
+  seminaive). Programs must be run to a fixpoint. This is acceptable because
+  rule-splitting (A) already gives correct seminaive behavior as the reference.
+- **Union bags are forced to be the leading bags.** The disjunction is not integrated
+  into the tree-decomposition cost model; the surrounding conjunction is planned as a
+  single bag joined against the union materializations.
+- **No primitives inside a branch.** Branches may contain only table atoms.
+- **Unsupported under proofs / term encoding.** `OR` rules are rejected in those modes
+  (a proof would need to record which branch witnessed a match).
 
-Because rule-splitting (A) already gives correct seminaive behavior, B is best viewed
-as an optimization that a rule can *opt into* (e.g. when branch counts or shared outer
-work make blowup expensive), not a wholesale replacement.
+### Strategy C — native streaming union operator in free join
 
-### Strategy C — native union operator in free join
-
-Add a first-class `Union` node to the execution plan (`Plan`/`JoinStage` in
-`plan.rs`, executed in `core-relations/src/free_join/execute.rs`) that enumerates
-each branch's satisfying tuples and yields their projection onto `V` to the
-continuation, deduplicating on the fly. This avoids materializing `R_or` when the
-outer query consumes it in a streaming fashion, but it is the most invasive: the join
-executor, the cost model, and seminaive variant generation all must learn about the
-new node. Only worth it if profiling shows materialization (B) is the bottleneck.
+A first-class `Union` node in the execution plan that enumerates each branch's
+tuples and yields their `π_V` to the continuation with on-the-fly dedup, avoiding
+materialization. The most invasive option (see §5); future work.
 
 ### Comparison
 
-| | A: rule-splitting | B: materialized union | C: native union node |
+| | A: rule-splitting | B: materialized union (current) | C: native union node |
 |---|---|---|---|
-| Backend changes | none | moderate (bridge + planner) | large (planner + executor) |
+| Backend changes | none | moderate (planner + bridge) | large (planner + executor) |
 | Rule blowup | `∏ mᵢ` | none | none |
 | Redundant firing | yes (idempotent) | no (set union) | no (dedup) |
 | Outer work shared | no | yes | yes |
-| Seminaive | free | needs delta maintenance | needs delta maintenance |
+| Seminaive | free | no (whole-table) | needs delta maintenance |
 | Streaming (no materialize) | n/a | no | yes |
 
-## 5. Recommendation
+## 5. Status and future work
 
-1. **Ship Strategy A** as the semantics and surface syntax (done). It is correct,
-   composes with seminaive and proofs, and needs no backend work.
-2. **Add Strategy B behind the scenes** as an optimization the planner applies when a
-   rule has disjunctions whose blowup or shared outer work is significant, reusing the
-   existing bag-materialization path. Keep A as the fallback and as the reference
-   semantics for testing (B must produce the same fixpoint as A).
-3. **Consider Strategy C** only if profiling implicates materialization.
+Strategy B is the shipped backend. Strategy A remains the reference semantics: any
+backend must produce the same fixpoint as A on the same input.
 
-## 6. Open questions / future work
-
-- **Error messages.** Distribution reports a bare "unbound variable" for a
-  common-variable violation. A dedicated pre-pass over the surface body could compute
-  the common variables of each `OR` and report a targeted error that names the `OR`
-  and the offending branch.
-- **`fail` atomicity.** `(fail (rule-with-OR ...))` currently runs the leading product
-  rules for real and only asserts the last one fails (matching the existing `fail`
-  desugaring). This is moot for typecheck errors — which escape `fail` entirely in
-  egglog — but a group/transactional command would make `fail` over multi-expansions
-  clean.
-- **Equivalence testing for B/C.** Any backend implementation should be differentially
-  tested against Strategy A on the same programs: same database in ⇒ same e-graph out.
-- **Proof support.** Under A, proofs work unchanged because only ordinary rules reach
-  the proof machinery. B/C would need to record which branch witnessed a match to
-  reconstruct provenance.
+- **Seminaive through unions.** B recomputes each union in full every iteration. A
+  delta scheme (recompute only branch deltas, treat the union's new rows as the outer
+  delta) would restore incrementality; it requires the union bag to participate in
+  seminaive variant expansion (`egglog-bridge/src/rule.rs`, `add_rules_from_cached`).
+- **Cost-model integration.** Union bags are currently forced to be the leading bags
+  rather than placed by the tree-decomposition heuristics.
+- **Primitives in branches.** Not yet supported; a branch may contain only table atoms.
+- **Proof support.** `OR` rules are rejected under proofs/term encoding. Supporting
+  them needs the union to record which branch witnessed a match to reconstruct
+  provenance.
+- **Strategy C (streaming union node).** A first-class `Union` `JoinStage` that yields
+  each branch's `π_V` to the continuation with on-the-fly dedup would avoid
+  materializing the union. Most invasive (executor + cost model + seminaive); only
+  worth it if profiling implicates materialization.
 
 ## Key code references
 
-- Surface parsing / distribution: `src/ast/parse.rs` (`expand_or_body`, `OR_HEAD`,
-  the `"rule"` and `"fail"` command arms).
-- Fact/rule AST: `egglog-ast/src/generic_ast.rs:35` (`GenericFact`), `:107`
-  (`GenericRule`).
-- Query lowering & variable binding: `src/core.rs:374` (`Query`), `:412` (`get_vars`),
-  `to_core_rule`; binding handed to actions in `src/typechecking.rs`.
-- Bridge rule building: `egglog-bridge/src/rule.rs` (`RuleBuilder`, `query_table`,
-  `build`, `add_rules_from_cached` for seminaive).
-- Backend planning/execution: `core-relations/src/free_join/plan.rs` (hypertree
-  decomposition, `DecomposedPlan`, materialization), `core-relations/src/free_join/execute.rs`
-  (`run_rule_set`).
-- Boolean `or` primitive (the name we avoid): `src/sort/bool.rs:27`.
+- Surface parsing: `src/ast/parse.rs` (`OR_HEAD`, `parse_fact`).
+- Fact/rule AST: `egglog-ast/src/generic_ast.rs` (`GenericFact::Or`); the `map_symbols`
+  / `visit_exprs` recursion in `egglog-ast/src/generic_ast_helpers.rs`.
+- Typechecking: `src/typechecking.rs` (`typecheck_rule_with_or`, `flatten_or_branches`,
+  `common_branch_vars`; `TypeError::OrBranchLocalEscapes` / `EmptyOrBranch`).
+- Frontend → backend: `src/lib.rs` (`add_rule`, `lower_or_groups`, `LoweredOrGroup`,
+  `resolved_common_vars`, `BackendRule::unions`); `src/core.rs` (`to_core_rule`'s
+  `extra_bound`).
+- Bridge: `egglog-bridge/src/rule.rs` (`RuleBuilder::query_union`, `BridgeUnion`,
+  `build_cached_plan`).
+- Planner: `core-relations/src/query.rs` (`QueryBuilder::add_union`, `UnionSpec`);
+  `core-relations/src/free_join/plan.rs` (`plan_union_query`, `UnionPlan`, `UnionMat`,
+  `build_union_result_block`).
+- Executor: `core-relations/src/free_join/execute.rs` (`run_union_plan_serial`,
+  `dedup_union_mat`).
+- Boolean `or` primitive (the name we avoid): `src/sort/bool.rs`.

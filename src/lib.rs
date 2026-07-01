@@ -1133,13 +1133,98 @@ impl EGraph {
         Ok(RunReport::singleton(ruleset, iteration_report))
     }
 
+    /// Lower each `OR` in a resolved rule body into a [`LoweredOrGroup`]: its
+    /// shared (common) variables and one canonicalized core query per branch.
+    /// Branches are lowered via [`to_canonicalized_core_rule`] on a headless rule
+    /// so they reuse the ordinary flattening/canonicalization path.
+    fn lower_or_groups(&mut self, body: &[ResolvedFact]) -> Result<Vec<LoweredOrGroup>, Error> {
+        let mut groups = Vec::new();
+        for fact in body {
+            let ResolvedFact::Or(span, branches) = fact else {
+                continue;
+            };
+            let common_vars = resolved_common_vars(branches);
+            let common_names: HashSet<String> =
+                common_vars.iter().map(|v| v.name.clone()).collect();
+            let mut branch_queries = Vec::with_capacity(branches.len());
+            for branch in branches {
+                // Rename branch-local variables to fresh names so that distinct
+                // branches never share a variable (their locals are independent),
+                // while common variables keep their names so they unify across the
+                // union boundary.
+                let mut renaming: HashMap<String, String> = HashMap::default();
+                let renamed: Vec<ResolvedFact> = branch
+                    .iter()
+                    .map(|fact| {
+                        fact.clone()
+                            .map_symbols(&mut |h| h, &mut |mut v: ResolvedVar| {
+                                if !common_names.contains(&v.name) {
+                                    v.name = renaming
+                                        .entry(v.name.clone())
+                                        .or_insert_with(|| self.parser.symbol_gen.fresh(&v.name))
+                                        .clone();
+                                }
+                                v
+                            })
+                    })
+                    .collect();
+                let branch_rule = ast::ResolvedRule {
+                    span: span.clone(),
+                    head: ResolvedActions::default(),
+                    body: renamed,
+                    name: String::new(),
+                    ruleset: String::new(),
+                    eval_mode: RuleEvalMode::default(),
+                    no_decomp: false,
+                    include_subsumed: false,
+                };
+                let core = branch_rule.to_canonicalized_core_rule(
+                    &self.type_info,
+                    &mut self.parser.symbol_gen,
+                    self.proof_state.original_typechecking.is_none(),
+                    &[],
+                )?;
+                branch_queries.push(core.body);
+            }
+            groups.push(LoweredOrGroup {
+                common_vars,
+                branches: branch_queries,
+            });
+        }
+        Ok(groups)
+    }
+
     fn add_rule(&mut self, rule: ast::ResolvedRule) -> Result<String, Error> {
+        // `OR` disjunctions are not supported under proof or term-encoding modes
+        // (the proof machinery would need to record which branch witnessed a
+        // match). Reject them with a clear error rather than hit a proof-path
+        // panic later.
+        if self.proof_state.original_typechecking.is_some()
+            && rule.body.iter().any(|f| matches!(f, ResolvedFact::Or(..)))
+        {
+            return Err(Error::BackendError(
+                "OR disjunctions are not supported with proofs or term encoding enabled"
+                    .to_string(),
+            ));
+        }
+
+        // Pull any `OR` disjunctions out of the body: they are lowered to a
+        // materialized union in the backend rather than into the flat
+        // conjunctive core query. Their shared variables are bound by the union,
+        // so they are passed as `extra_bound` for action binding.
+        let or_groups = self.lower_or_groups(&rule.body)?;
+        let extra_bound: Vec<ResolvedVar> = or_groups
+            .iter()
+            .flat_map(|group| group.common_vars.iter().cloned())
+            .collect();
+
         // Disable union_to_set optimization in proof or term encoding mode, since
         // it expects only `union` on constructors (not set).
         let core_rule = rule.to_canonicalized_core_rule(
             &self.type_info,
             &mut self.parser.symbol_gen,
             self.proof_state.original_typechecking.is_none(),
+            &extra_bound,
         )?;
         let (query, actions) = (&core_rule.body, &core_rule.head);
 
@@ -1164,6 +1249,7 @@ impl EGraph {
             let mut translator =
                 BackendRule::new(rb, &self.functions, &self.type_info, requires_read_context);
             translator.query(query, rule.include_subsumed);
+            translator.unions(&or_groups, rule.include_subsumed)?;
             translator.actions(actions)?;
             translator.build()
         };
@@ -1535,10 +1621,16 @@ impl EGraph {
             no_decomp: false,
             include_subsumed: false,
         };
+        let or_groups = self.lower_or_groups(&rule.body)?;
+        let extra_bound: Vec<ResolvedVar> = or_groups
+            .iter()
+            .flat_map(|group| group.common_vars.iter().cloned())
+            .collect();
         let core_rule = rule.to_canonicalized_core_rule(
             &self.type_info,
             &mut self.parser.symbol_gen,
             self.proof_state.original_typechecking.is_none(),
+            &extra_bound,
         )?;
         let query = core_rule.body;
 
@@ -1558,6 +1650,7 @@ impl EGraph {
             true, // global query: Read context (may read the DB)
         );
         translator.query(&query, true);
+        translator.unions(&or_groups, true)?;
         translator
             .rb
             .call_external_func(ext_id, &[], egglog_bridge::ColumnTy::Id, || {
@@ -1947,8 +2040,7 @@ impl EGraph {
         &mut self,
         command: Command,
     ) -> Result<Vec<ResolvedNCommand>, Error> {
-        let desugared =
-            desugar_command(command, &mut self.parser, self.proof_state.proof_testing)?;
+        let desugared = desugar_command(command, &mut self.parser, self.proof_state.proof_testing)?;
         if let Some(original_typechecking) = self.proof_state.original_typechecking.as_mut() {
             // Typecheck using the original egraph
             // TODO this is ugly- we don't need an entire e-graph just for type information.
@@ -2541,6 +2633,47 @@ fn resolve_function_container_target_with_context(
     })
 }
 
+/// An `OR` disjunction lowered for the backend: the variables shared by every
+/// branch (its interface) and one canonicalized core query per branch.
+struct LoweredOrGroup {
+    common_vars: Vec<ResolvedVar>,
+    branches: Vec<core::Query<ResolvedCall, ResolvedVar>>,
+}
+
+/// The variables shared by every branch of a resolved `OR` (its common /
+/// interface variables), in first-occurrence order within the first branch.
+fn resolved_common_vars(branches: &[Vec<ResolvedFact>]) -> Vec<ResolvedVar> {
+    fn fact_vars_in_order(fact: &ResolvedFact, out: &mut Vec<ResolvedVar>) {
+        fact.visit_vars(&mut |_span, v| {
+            if !out.iter().any(|u| u.name == v.name) {
+                out.push(v.clone());
+            }
+        });
+    }
+    fn branch_var_names(branch: &[ResolvedFact]) -> HashSet<String> {
+        let mut names = HashSet::default();
+        for fact in branch {
+            fact.visit_vars(&mut |_span, v| {
+                names.insert(v.name.clone());
+            });
+        }
+        names
+    }
+
+    let Some(first) = branches.first() else {
+        return Vec::new();
+    };
+    let branch_names: Vec<HashSet<String>> = branches.iter().map(|b| branch_var_names(b)).collect();
+    let mut ordered = Vec::new();
+    for fact in first {
+        fact_vars_in_order(fact, &mut ordered);
+    }
+    ordered
+        .into_iter()
+        .filter(|v| branch_names.iter().all(|names| names.contains(&v.name)))
+        .collect()
+}
+
 struct BackendRule<'a> {
     rb: egglog_bridge::RuleBuilder<'a>,
     entries: HashMap<core::ResolvedAtomTerm, QueryEntry>,
@@ -2687,6 +2820,49 @@ impl<'a> BackendRule<'a> {
                 }
             }
         }
+    }
+
+    /// Emit each `OR` disjunction as a materialized union on the backend rule.
+    ///
+    /// For every branch we add its table atoms (collecting their bridge atom
+    /// ids), then register the union keyed on the group's common variables via
+    /// [`egglog_bridge::RuleBuilder::query_union`]. Branch primitives are not
+    /// supported.
+    fn unions(&mut self, groups: &[LoweredOrGroup], include_subsumed: bool) -> Result<(), Error> {
+        let is_subsumed = match include_subsumed {
+            true => None,
+            false => Some(false),
+        };
+        for group in groups {
+            let mut branches: Vec<Vec<egglog_bridge::AtomId>> =
+                Vec::with_capacity(group.branches.len());
+            for branch in &group.branches {
+                let mut atom_ids = Vec::with_capacity(branch.atoms.len());
+                for atom in &branch.atoms {
+                    match &atom.head {
+                        ResolvedCall::Func(f) => {
+                            let f = self.func(f);
+                            let args = self.args(&atom.args);
+                            let id = self.rb.query_table(f, &args, is_subsumed).unwrap();
+                            atom_ids.push(id);
+                        }
+                        ResolvedCall::Primitive(_) => {
+                            return Err(Error::BackendError(
+                                "primitives are not supported inside an OR branch".to_string(),
+                            ));
+                        }
+                    }
+                }
+                branches.push(atom_ids);
+            }
+            let output_vars: Vec<QueryEntry> = group
+                .common_vars
+                .iter()
+                .map(|v| self.entry(&core::GenericAtomTerm::Var(Span::Panic, v.clone())))
+                .collect();
+            self.rb.query_union(&output_vars, branches);
+        }
+        Ok(())
     }
 
     fn actions(&mut self, actions: &core::ResolvedCoreActions) -> Result<(), Error> {

@@ -3,7 +3,7 @@
 use std::{iter::once, sync::Arc};
 
 use crate::{
-    free_join::plan::{DecomposedPlan, JoinStageBlocks, SinglePlan},
+    free_join::plan::{DecomposedPlan, JoinStageBlocks, SinglePlan, UnionPlan},
     numeric_id::{DenseIdMap, IdVec, NumericId, define_id},
 };
 use smallvec::SmallVec;
@@ -126,6 +126,7 @@ impl<'outer> RuleSetBuilder<'outer> {
                 plan_strategy: Default::default(),
                 fun_deps: Default::default(),
                 no_decomp: false,
+                unions: Default::default(),
             },
         }
     }
@@ -237,6 +238,27 @@ impl<'outer> RuleSetBuilder<'outer> {
                     stages: JoinStageBlocks { blocks },
                     actions: action_id,
                     result_block,
+                }))
+            }
+            Plan::UnionPlan(cached_plan) => {
+                // Union rules run naive (whole-table); seminaive delta through a
+                // union is unsupported, so no timestamp `extra_constraints` are
+                // expected here. Any header-level constant constraints are still
+                // reprocessed for the current database state.
+                let mut headers = vec![];
+                self.push_extra_constraints(&mut headers, &cached_plan.atoms, extra_constraints)?;
+                self.reprocess_existing_headers(
+                    &mut headers,
+                    &cached_plan.atoms,
+                    &cached_plan.header,
+                )?;
+                Some(Plan::UnionPlan(UnionPlan {
+                    atoms: cached_plan.atoms.clone(),
+                    header: headers,
+                    union_mats: cached_plan.union_mats.clone(),
+                    body_blocks: cached_plan.body_blocks.clone(),
+                    result_block: cached_plan.result_block.clone(),
+                    actions: action_id,
                 }))
             }
         }
@@ -460,6 +482,25 @@ impl<'outer, 'a> QueryBuilder<'outer, 'a> {
         self.query.fun_deps.add_dependency(antecedent, consequent);
 
         Ok(self.query.atoms.push(atom))
+    }
+
+    /// Register a disjunction (`OR`) in the query.
+    ///
+    /// `output_vars` are the variables shared by every branch (the only ones
+    /// visible to the rest of the query). `branches` gives, per branch, the
+    /// [`AtomId`]s previously returned by [`add_atom`](Self::add_atom) for that
+    /// branch's conjunctive subquery. The query matches when any branch matches;
+    /// the planner materializes `⋃ᵢ πₒᵤₜₚᵤₜ(branchᵢ)` and joins the rest of the
+    /// query against it. Branch-local variables must not appear outside their
+    /// branch.
+    pub fn add_union(&mut self, output_vars: &[Variable], branches: Vec<Vec<AtomId>>) {
+        for var in output_vars {
+            self.query.var_info[*var].used_in_rhs = true;
+        }
+        self.query.unions.push(UnionSpec {
+            output_vars: output_vars.to_vec(),
+            branches,
+        });
     }
 }
 
@@ -1048,4 +1089,20 @@ pub(crate) struct Query {
     /// [`crate::free_join::plan::tree_decompose_and_plan`]. Set via
     /// [`QueryBuilder::set_no_decomp`].
     pub(crate) no_decomp: bool,
+    /// Disjunctions (`OR`) in the query body. Each [`UnionSpec`] is materialized
+    /// as the union of its branches' projections onto the shared output
+    /// variables, and the rest of the query joins against that materialization.
+    /// See [`QueryBuilder::add_union`] and the union planning path in
+    /// [`crate::free_join::plan`].
+    pub(crate) unions: Vec<UnionSpec>,
+}
+
+/// A disjunction in a query: the query matches when any branch matches, exposing
+/// only the `output_vars` (the variables shared by every branch) to the rest of
+/// the query. Each branch is the set of [`AtomId`]s of a conjunctive subquery
+/// added via [`QueryBuilder::add_atom`].
+#[derive(Clone, Debug)]
+pub(crate) struct UnionSpec {
+    pub(crate) output_vars: Vec<Variable>,
+    pub(crate) branches: Vec<Vec<AtomId>>,
 }

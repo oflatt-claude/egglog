@@ -2,15 +2,16 @@ use std::hash::Hasher;
 
 use crate::Context;
 use crate::{
-    core::{CoreActionContext, CoreRule, GenericActionsExt, ResolvedCall},
+    core::{CoreActionContext, CoreRule, GenericActionsExt, Query, ResolvedCall, StringOrEq},
     *,
 };
 use ast::{
-    MappedExprExt, ResolvedAction, ResolvedExpr, ResolvedFact, ResolvedRule, ResolvedVar, Rule,
-    RuleEvalMode,
+    Fact, MappedExprExt, MappedFact, ResolvedAction, ResolvedExpr, ResolvedFact, ResolvedRule,
+    ResolvedVar, Rule, RuleEvalMode,
 };
 use core_relations::ExternalFunction;
 use egglog_ast::generic_ast::GenericAction;
+use egglog_ast::generic_ast::{GenericActions, GenericExpr};
 use egglog_bridge::ActionRegistry;
 use enum_map::EnumMap;
 use std::sync::{Arc, RwLock};
@@ -857,6 +858,10 @@ impl TypeInfo {
             (Context::Pure, Context::Write)
         };
 
+        if body.iter().any(fact_has_or) {
+            return self.typecheck_rule_with_or(symbol_gen, rule, query_ctx, action_ctx);
+        }
+
         let (query, mapped_query) = Facts(body.clone()).to_query(self, symbol_gen);
         constraints.extend(query.get_constraints(self, query_ctx)?);
 
@@ -896,6 +901,191 @@ impl TypeInfo {
         Ok(ResolvedRule {
             span: span.clone(),
             body,
+            head: actions,
+            name: name.clone(),
+            ruleset: ruleset.clone(),
+            eval_mode: *eval_mode,
+            no_decomp: *no_decomp,
+            include_subsumed: *include_subsumed,
+        })
+    }
+
+    /// Typecheck a rule whose body contains one or more `OR` disjunctions.
+    ///
+    /// The conjunctive facts and each `OR` branch are all added to a single
+    /// constraint [`Problem`] (branch-local variables renamed fresh per branch so
+    /// they cannot collide), so variables shared across the `OR` boundary unify to
+    /// a single sort. The interface rule — only variables common to every branch
+    /// may be used outside the `OR` — is enforced on the original names before
+    /// renaming. The result carries each disjunction as a [`ResolvedFact::Or`].
+    fn typecheck_rule_with_or(
+        &self,
+        symbol_gen: &mut SymbolGen,
+        rule: &Rule,
+        query_ctx: Context,
+        action_ctx: Context,
+    ) -> Result<ResolvedRule, TypeError> {
+        let Rule {
+            span,
+            head,
+            body,
+            name,
+            ruleset,
+            eval_mode,
+            no_decomp,
+            include_subsumed,
+        } = rule;
+
+        // Split the body into its conjunctive facts and its disjunctions,
+        // preserving order. Each disjunction is normalized to a flat list of
+        // conjunctive branches (nested `OR`s are flattened via DNF).
+        let mut conj_facts: Vec<Fact> = Vec::new();
+        // For each OR (in body order): (span, normalized branches).
+        let mut or_groups: Vec<(Span, Vec<Vec<Fact>>)> = Vec::new();
+        for fact in body {
+            match fact {
+                Fact::Or(or_span, branches) => {
+                    let branches = flatten_or_branches(or_span, branches)?;
+                    or_groups.push((or_span.clone(), branches));
+                }
+                other => conj_facts.push(other.clone()),
+            }
+        }
+
+        // Variables that appear outside a given OR: the conjunctive facts, the
+        // actions, and every *other* OR group. Used to enforce the interface
+        // rule.
+        let conj_vars: HashSet<String> = conj_facts.iter().flat_map(fact_vars).collect();
+        let action_vars: HashSet<String> = actions_vars(head);
+        let group_all_vars: Vec<HashSet<String>> = or_groups
+            .iter()
+            .map(|(_, branches)| branches.iter().flatten().flat_map(fact_vars).collect())
+            .collect();
+
+        // Common variables of each OR group: variables present in *every* branch.
+        let common_vars: Vec<Vec<String>> = or_groups
+            .iter()
+            .map(|(_, branches)| common_branch_vars(branches))
+            .collect();
+
+        // Enforce the interface rule: a variable that is bound only in some
+        // branches (branch-local) must not be used outside its OR.
+        for (gi, (or_span, _branches)) in or_groups.iter().enumerate() {
+            let common: HashSet<&String> = common_vars[gi].iter().collect();
+            let mut outside: HashSet<&String> = HashSet::default();
+            outside.extend(conj_vars.iter());
+            outside.extend(action_vars.iter());
+            for (gj, other) in group_all_vars.iter().enumerate() {
+                if gj != gi {
+                    outside.extend(other.iter());
+                }
+            }
+            for var in group_all_vars[gi].iter() {
+                if !common.contains(&var) && outside.contains(&var) {
+                    return Err(TypeError::OrBranchLocalEscapes(
+                        var.clone(),
+                        or_span.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Build the constraint problem. The conjunctive facts and every branch
+        // contribute atoms so that shared variables get a single, unified sort.
+        let (conj_query, conj_mapped) = Facts(conj_facts.clone()).to_query(self, symbol_gen);
+
+        // For each OR group, for each branch: rename branch-local variables to
+        // fresh names (unique per branch) and lower to a query + mapped facts.
+        let mut group_branch_queries: Vec<Vec<BranchQuery>> = Vec::with_capacity(or_groups.len());
+        for (gi, (_, branches)) in or_groups.iter().enumerate() {
+            let common: HashSet<&String> = common_vars[gi].iter().collect();
+            let mut branch_queries = Vec::with_capacity(branches.len());
+            for branch in branches {
+                // Rename branch-local vars to fresh names so distinct branches'
+                // locals never unify; common vars keep their names.
+                let mut renaming: HashMap<String, String> = HashMap::default();
+                let renamed: Vec<Fact> = branch
+                    .iter()
+                    .map(|fact| {
+                        fact.clone().map_symbols(&mut |h| h, &mut |leaf: String| {
+                            if common.contains(&leaf) {
+                                leaf
+                            } else {
+                                renaming
+                                    .entry(leaf.clone())
+                                    .or_insert_with(|| symbol_gen.fresh(&leaf))
+                                    .clone()
+                            }
+                        })
+                    })
+                    .collect();
+                let (branch_query, branch_mapped) = Facts(renamed).to_query(self, symbol_gen);
+                branch_queries.push((branch_query, branch_mapped));
+            }
+            group_branch_queries.push(branch_queries);
+        }
+
+        // The variables visible to the actions: conjunctive vars plus each OR's
+        // common vars.
+        let mut binding = conj_query.get_vars();
+        for common in &common_vars {
+            for v in common {
+                binding.insert(v.clone());
+            }
+        }
+
+        let mut ctx = CoreActionContext::new(self, &mut binding, symbol_gen, false);
+        let (core_actions, mapped_action) = head.to_core_actions(&mut ctx)?;
+
+        // Assemble the constraint problem: conjunctive body + all branch atoms +
+        // actions.
+        let mut problem = Problem::default();
+        problem.add_query(&conj_query, self, query_ctx)?;
+        for branch_queries in &group_branch_queries {
+            for (branch_query, _) in branch_queries {
+                problem.add_query(branch_query, self, query_ctx)?;
+            }
+        }
+        problem.add_actions(&core_actions, self, symbol_gen, action_ctx)?;
+
+        let assignment = problem
+            .solve(|sort: &ArcSort| sort.name())
+            .map_err(|e| e.to_type_error())?;
+
+        // Annotate the conjunctive facts, then splice each OR back into place in
+        // body order.
+        let conj_resolved = assignment.annotate_facts(&conj_mapped, self, query_ctx);
+        let mut resolved_body: Vec<ResolvedFact> = Vec::with_capacity(body.len());
+        let mut conj_iter = conj_resolved.into_iter();
+        let mut group_iter = group_branch_queries.iter().zip(or_groups.iter());
+        for fact in body {
+            match fact {
+                Fact::Or(..) => {
+                    let (branch_queries, (or_span, _)) =
+                        group_iter.next().expect("OR groups counted from body");
+                    let branches: Vec<Vec<ResolvedFact>> = branch_queries
+                        .iter()
+                        .map(|(_, branch_mapped)| {
+                            assignment.annotate_facts(branch_mapped, self, query_ctx)
+                        })
+                        .collect();
+                    resolved_body.push(ResolvedFact::Or(or_span.clone(), branches));
+                }
+                _ => resolved_body.push(conj_iter.next().expect("conjunctive facts counted")),
+            }
+        }
+
+        let actions: ResolvedActions =
+            assignment.annotate_actions(&mapped_action, self, action_ctx)?;
+
+        if !matches!(query_ctx, Context::Read) {
+            // Mirror the seminaive/non-read check in `typecheck_rule`.
+            self.check_no_function_lookups_in_actions(&actions)?;
+        }
+
+        Ok(ResolvedRule {
+            span: span.clone(),
+            body: resolved_body,
             head: actions,
             name: name.clone(),
             ruleset: ruleset.clone(),
@@ -1203,6 +1393,120 @@ pub enum TypeError {
         crate::GLOBAL_NAME_PREFIX
     )]
     GlobalMissingPrefix { name: String, span: Span },
+}
+
+/// A lowered `OR` branch during typechecking: its flat query (for the constraint
+/// problem) paired with the mapped facts used to annotate it back into a
+/// [`ResolvedFact`].
+type BranchQuery = (Query<StringOrEq, String>, Vec<MappedFact<String, String>>);
+
+/// Whether a fact is (or contains, at the top level) an `OR` disjunction.
+fn fact_has_or(fact: &Fact) -> bool {
+    matches!(fact, Fact::Or(..))
+}
+
+/// Normalize an `OR`'s branches into a flat list of conjunctive branches
+/// (disjunctive normal form), flattening any nested `OR`s. Errors if any branch
+/// is empty (`EmptyOrBranch`).
+fn flatten_or_branches(
+    or_span: &Span,
+    branches: &[Vec<Fact>],
+) -> Result<Vec<Vec<Fact>>, TypeError> {
+    if branches.is_empty() {
+        // The parser rejects an empty `OR`, but be defensive.
+        return Err(TypeError::EmptyOrBranch(or_span.clone()));
+    }
+    let mut out: Vec<Vec<Fact>> = Vec::new();
+    for branch in branches {
+        if branch.is_empty() {
+            return Err(TypeError::EmptyOrBranch(or_span.clone()));
+        }
+        // Turn this branch (a conjunction that may itself contain `OR`s) into a
+        // disjunction of pure-conjunction branches via distribution.
+        let mut alternatives: Vec<Vec<Fact>> = vec![vec![]];
+        for fact in branch {
+            match fact {
+                Fact::Or(inner_span, inner_branches) => {
+                    let inner = flatten_or_branches(inner_span, inner_branches)?;
+                    let mut next: Vec<Vec<Fact>> = Vec::new();
+                    for alt in &alternatives {
+                        for inner_branch in &inner {
+                            let mut combined = alt.clone();
+                            combined.extend(inner_branch.iter().cloned());
+                            next.push(combined);
+                        }
+                    }
+                    alternatives = next;
+                }
+                other => {
+                    for alt in alternatives.iter_mut() {
+                        alt.push(other.clone());
+                    }
+                }
+            }
+        }
+        out.extend(alternatives);
+    }
+    Ok(out)
+}
+
+/// All variable names occurring in a fact (recursing into nested `OR`s).
+fn fact_vars(fact: &Fact) -> HashSet<String> {
+    let mut vars = HashSet::default();
+    fact.visit_vars(&mut |_span, v| {
+        vars.insert(v.clone());
+    });
+    vars
+}
+
+/// All variable names occurring in a rule's actions.
+fn actions_vars(actions: &GenericActions<String, String>) -> HashSet<String> {
+    let mut vars = HashSet::default();
+    actions.clone().visit_exprs(&mut |expr| {
+        if let GenericExpr::Var(_, v) = &expr {
+            vars.insert(v.clone());
+        }
+        expr
+    });
+    vars
+}
+
+/// Variables present in *every* branch of a normalized disjunction (its common /
+/// interface variables), in the order they first appear in the first branch.
+fn common_branch_vars(branches: &[Vec<Fact>]) -> Vec<String> {
+    let branch_var_sets: Vec<HashSet<String>> = branches
+        .iter()
+        .map(|branch| branch.iter().flat_map(fact_vars).collect())
+        .collect();
+    let Some(first) = branches.first() else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut common = Vec::new();
+    for fact in first {
+        for var in ordered_fact_vars(fact) {
+            if seen.contains(&var) {
+                continue;
+            }
+            if branch_var_sets.iter().all(|s| s.contains(&var)) {
+                seen.insert(var.clone());
+                common.push(var);
+            }
+        }
+    }
+    common
+}
+
+/// Variable names of a fact in first-occurrence order.
+fn ordered_fact_vars(fact: &Fact) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut vars = Vec::new();
+    fact.visit_vars(&mut |_span, v| {
+        if seen.insert(v.clone()) {
+            vars.push(v.clone());
+        }
+    });
+    vars
 }
 
 #[cfg(test)]
