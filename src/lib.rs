@@ -1209,27 +1209,29 @@ impl EGraph {
         }
     }
 
-    /// Compiles a rule whose body contains one or more `or` facts.
+    /// Compiles a rule whose body contains one or more `or` facts into a single
+    /// backend rule with a fused, **deduplicating** union node in the free-join
+    /// engine (see [`egglog_bridge::RuleBuilder::set_union_branches`] and
+    /// `core_relations::QueryBuilder::set_union`). Every branch is evaluated
+    /// additively, its output tuple is materialized and **deduplicated on the
+    /// union's output variables**, and the shared action fires exactly once per
+    /// distinct output tuple.
     ///
-    /// Two strategies:
-    /// - **Fused union (Strategy C).** When every disjunct is *self-groundable*
-    ///   (binds all its own variables with its own table atoms) and the rule is
-    ///   naive, the whole `or` compiles to a single backend rule with a fused
-    ///   union node: the surrounding conjunction is joined once against the
-    ///   deduplicated union of the branch outputs (see
-    ///   [`egglog_bridge::RuleBuilder::set_union_branches`] and
-    ///   `core_relations::QueryBuilder::set_union`).
-    /// - **Splitting (Strategy D).** Otherwise — a *correlated* branch (one that
-    ///   references a variable bound by the surrounding conjunction, e.g.
-    ///   `(= col d)`), or a seminaive rule — the `or` compiles to one backend
-    ///   rule per disjunct, each the surrounding conjunction conjoined with that
-    ///   disjunct and the shared action. Each split rule is an ordinary
-    ///   conjunctive rule, so seminaive evaluation and index-probe joins work
-    ///   normally: a delta on an outer atom drives an index probe of the atom a
-    ///   correlated equality constrains, with no cartesian product.
+    /// Two branch layouts, chosen by whether any disjunct is *correlated* (i.e.
+    /// references a variable bound by the surrounding conjunction that is not
+    /// common to every disjunct):
+    /// - **Independent.** The surrounding conjunction `C` is a continuation:
+    ///   scanned once and joined against the deduplicated union of the branch
+    ///   outputs. Output variables are the variables common to every disjunct.
+    /// - **Correlated.** `C` is prepended into every branch so each branch binds
+    ///   the shared output tuple itself (typically the surrounding row) and
+    ///   probes the disjunct's own atoms by the correlated columns. The output
+    ///   variables are the variables common to every (prepended) branch — the
+    ///   surrounding row. Deduplicating on that row gives disjunctive-semijoin
+    ///   semantics: a row matched via several branches is rebuilt exactly once.
     ///
-    /// Returns one `(name, core rule, backend rule id)` per compiled backend
-    /// rule (one for a fused union, one per disjunct when splitting).
+    /// Branches must be conjunctions of table atoms; a branch primitive is
+    /// rejected (a staleness relation can encode a `!=` filter instead).
     fn add_or_rule(
         &mut self,
         rule: &ast::ResolvedRule,
@@ -1239,65 +1241,87 @@ impl EGraph {
         requires_read_context: bool,
     ) -> Result<Vec<(String, core::ResolvedCoreRule, egglog_bridge::RuleId)>, Error> {
         // Split the body into the surrounding conjunction and the `or`s, then
-        // form the branches as the cartesian product of every `or`'s branches
-        // (each combined branch is a conjunction, with nested `or`s expanded the
-        // same way). A single `or` gives one branch per disjunct.
+        // form the disjuncts as the cartesian product of every `or`'s branches
+        // (each combined disjunct is a conjunction, with nested `or`s expanded
+        // the same way). A single `or` gives one disjunct per branch.
         let mut conj_facts: Vec<ast::ResolvedFact> = Vec::new();
-        let mut combined_branches: Vec<Vec<ast::ResolvedFact>> = vec![vec![]];
+        let mut disjuncts: Vec<Vec<ast::ResolvedFact>> = vec![vec![]];
         for fact in &rule.body {
             match fact {
                 ast::ResolvedFact::Or(_, branches) => {
                     let branch_expansions: Vec<Vec<ast::ResolvedFact>> =
                         branches.iter().flat_map(|b| expand_or_branch(b)).collect();
-                    let mut next =
-                        Vec::with_capacity(combined_branches.len() * branch_expansions.len());
-                    for combo in &combined_branches {
+                    let mut next = Vec::with_capacity(disjuncts.len() * branch_expansions.len());
+                    for combo in &disjuncts {
                         for expansion in &branch_expansions {
                             let mut new_combo = combo.clone();
                             new_combo.extend(expansion.iter().cloned());
                             next.push(new_combo);
                         }
                     }
-                    combined_branches = next;
+                    disjuncts = next;
                 }
                 other => conj_facts.push(other.clone()),
             }
         }
 
-        // Correlated (non-self-groundable) branches and seminaive rules can't use
-        // C's fused union node (its branches must bind the union's output vars
-        // themselves, and it forces naive mode). Fall back to splitting.
-        let fused_union_ok =
-            !seminaive && combined_branches.iter().all(|b| branch_self_groundable(b));
-        if !fused_union_ok {
-            return self.add_or_rule_split(
-                rule,
-                &conj_facts,
-                &combined_branches,
-                union_to_set,
-                seminaive,
-                no_decomp,
-                requires_read_context,
-            );
-        }
+        // A disjunct is *correlated* if it references a variable bound by the
+        // surrounding conjunction that is not common to every disjunct (e.g.
+        // `(UF_Math a al)` where `a` comes from the outer row). Such a branch
+        // cannot bind the shared output row on its own, so the surrounding
+        // conjunction is prepended into every branch; the branches then bind the
+        // row and probe their own atoms by the correlated columns. Independent
+        // `or`s keep the conjunction as a scanned-once continuation.
+        let conj_vars = {
+            let mut m = IndexMap::default();
+            collect_resolved_fact_vars(&conj_facts, &mut m);
+            m
+        };
+        let disjunct_common = common_branch_vars(&disjuncts);
+        let disjunct_common_names: IndexSet<String> =
+            disjunct_common.iter().map(|v| v.name.clone()).collect();
+        let correlated = disjuncts.iter().any(|d| {
+            let mut m = IndexMap::default();
+            collect_resolved_fact_vars(d, &mut m);
+            m.keys()
+                .any(|name| conj_vars.contains_key(name) && !disjunct_common_names.contains(name))
+        });
 
-        // The variables visible outside the `or`s (shared with the surrounding
-        // conjunction and the action) are the union's output variables: the
-        // variables that appear in every branch of an `or`. We take, for each
-        // combined branch, the intersection of variable sets across all combined
-        // branches — a variable common to every combined branch is exactly a
-        // variable common to every disjunct of every `or`.
-        let output_resolved_vars = common_branch_vars(&combined_branches);
+        // Branch fact lists and continuation depend on the layout.
+        let (branch_fact_lists, continuation_facts): (Vec<Vec<ast::ResolvedFact>>, Vec<_>) =
+            if correlated {
+                let branches = disjuncts
+                    .iter()
+                    .map(|d| {
+                        let mut b = conj_facts.clone();
+                        b.extend(d.iter().cloned());
+                        b
+                    })
+                    .collect();
+                (branches, Vec::new())
+            } else {
+                (disjuncts.clone(), conj_facts.clone())
+            };
 
-        // Compile the surrounding conjunction's query and the rule's actions
-        // together, so their flattened (fresh) variables are consistent. The
-        // `or`'s output variables are added to the action binding: they are not
-        // in the conjunction's atoms but are bound by the fused union at
-        // runtime, and the actions may read them.
+        // The union's output/dedup variables are the variables common to every
+        // branch (with the conjunction prepended in the correlated case), shared
+        // with the continuation and the action. `Unit`-sorted variables are
+        // excluded: they carry no information for deduplication and (e.g. the
+        // unit result of a term-encoding view lookup) may not be materialized as
+        // a runtime binding.
+        let output_resolved_vars: Vec<ResolvedVar> = common_branch_vars(&branch_fact_lists)
+            .into_iter()
+            .filter(|v| v.sort.name() != "Unit")
+            .collect();
+
+        // Compile the continuation's query and the rule's actions together, so
+        // their flattened (fresh) variables are consistent. The output variables
+        // are added to the action binding: they are bound by the fused union at
+        // runtime and the actions may read them.
         let conj_rule = ast::ResolvedRule {
             span: rule.span.clone(),
             head: rule.head.clone(),
-            body: conj_facts.clone(),
+            body: continuation_facts,
             name: rule.name.clone(),
             ruleset: rule.ruleset.clone(),
             eval_mode: rule.eval_mode,
@@ -1311,12 +1335,12 @@ impl EGraph {
             &output_resolved_vars,
         )?;
 
-        // Flatten each combined branch into a canonicalized core query. The
-        // grounded check is skipped: a branch variable may be grounded by the
-        // surrounding conjunction rather than the branch.
+        // Flatten each branch into a canonicalized core query. The grounded
+        // check is skipped: a branch variable may be grounded by the surrounding
+        // conjunction rather than the branch.
         let mut branch_queries: Vec<core::Query<ResolvedCall, ResolvedVar>> =
-            Vec::with_capacity(combined_branches.len());
-        for branch in &combined_branches {
+            Vec::with_capacity(branch_fact_lists.len());
+        for branch in &branch_fact_lists {
             let branch_rule = ast::ResolvedRule {
                 span: rule.span.clone(),
                 head: Default::default(),
@@ -1335,14 +1359,18 @@ impl EGraph {
             branch_queries.push(core_branch.body);
         }
 
-        // Build the backend rule. Union rules run in naive mode (seminaive
-        // delta through a union is unsupported).
         let rule_id = {
+            // Run in naive mode: the seminaive delta machinery constrains atoms
+            // by their position in `plan.atoms`, but a union's branch atoms live
+            // in per-branch sub-plans, so a delta focus can't reach them. The
+            // `:unsafe-seminaive` Read/Full RHS context (for action lookups) is
+            // still honored via `requires_read_context`.
+            let _ = seminaive;
             let mut rb = self.backend.new_rule(&rule.name, false);
             rb.set_no_decomp(no_decomp);
             let mut translator =
                 BackendRule::new(rb, &self.functions, &self.type_info, requires_read_context);
-            // Continuation (surrounding conjunction) atoms.
+            // Continuation (surrounding conjunction) atoms, if any.
             translator.query(&core_conj.body, rule.include_subsumed);
             // Branch atoms, recording which backend AtomIds belong to each branch.
             let mut branch_atom_ids = Vec::with_capacity(branch_queries.len());
@@ -1363,62 +1391,6 @@ impl EGraph {
         };
 
         Ok(vec![(rule.name.clone(), core_conj, rule_id)])
-    }
-
-    /// Strategy D: compile an `or` rule by splitting it into one ordinary
-    /// backend rule per disjunct, each conjoining the surrounding conjunction
-    /// with that disjunct and firing the shared action. See [`Self::add_or_rule`].
-    #[allow(clippy::too_many_arguments)]
-    fn add_or_rule_split(
-        &mut self,
-        rule: &ast::ResolvedRule,
-        conj_facts: &[ast::ResolvedFact],
-        combined_branches: &[Vec<ast::ResolvedFact>],
-        union_to_set: bool,
-        seminaive: bool,
-        no_decomp: bool,
-        requires_read_context: bool,
-    ) -> Result<Vec<(String, core::ResolvedCoreRule, egglog_bridge::RuleId)>, Error> {
-        let mut compiled = Vec::with_capacity(combined_branches.len());
-        for (i, branch) in combined_branches.iter().enumerate() {
-            // Each split rule is `conjunction ∧ branch => action`. Per-branch
-            // canonicalization merges each disjunct's equalities (e.g. `(= col
-            // d)`) independently, so a correlated variable resolves correctly in
-            // both the body and the shared action.
-            let mut body = conj_facts.to_vec();
-            body.extend(branch.iter().cloned());
-            let name = if i == 0 {
-                rule.name.clone()
-            } else {
-                format!("{}__or{i}", rule.name)
-            };
-            let split_rule = ast::ResolvedRule {
-                span: rule.span.clone(),
-                head: rule.head.clone(),
-                body,
-                name: name.clone(),
-                ruleset: rule.ruleset.clone(),
-                eval_mode: rule.eval_mode,
-                no_decomp: rule.no_decomp,
-                include_subsumed: rule.include_subsumed,
-            };
-            let core_rule = split_rule.to_canonicalized_core_rule(
-                &self.type_info,
-                &mut self.parser.symbol_gen,
-                union_to_set,
-            )?;
-            let rule_id = {
-                let mut rb = self.backend.new_rule(&name, seminaive);
-                rb.set_no_decomp(no_decomp);
-                let mut translator =
-                    BackendRule::new(rb, &self.functions, &self.type_info, requires_read_context);
-                translator.query(&core_rule.body, split_rule.include_subsumed);
-                translator.actions(&core_rule.head)?;
-                translator.build()
-            };
-            compiled.push((name, core_rule, rule_id));
-        }
-        Ok(compiled)
     }
 
     fn eval_actions(&mut self, actions: &ResolvedActions) -> Result<(), Error> {
@@ -3042,35 +3014,6 @@ impl<'a> BackendRule<'a> {
     fn build(self) -> egglog_bridge::RuleId {
         self.rb.build()
     }
-}
-
-/// Whether every non-global variable referenced by `branch` is bound by one of
-/// the branch's own table (function/relation) atoms. A self-groundable branch
-/// can be evaluated by C's fused union node, which requires each branch to bind
-/// the union's output variables itself. A branch that references a variable it
-/// does not bind — a *correlated* branch, e.g. `(= col d)` where `col` and `d`
-/// come from the surrounding conjunction — is not self-groundable and is
-/// compiled by splitting instead.
-fn branch_self_groundable(branch: &[ast::ResolvedFact]) -> bool {
-    let mut bound: IndexSet<String> = IndexSet::default();
-    for fact in branch {
-        if let ast::ResolvedFact::Fact(ResolvedExpr::Call(_, ResolvedCall::Func(_), _)) = fact {
-            fact.visit_vars(&mut |_, v| {
-                if !v.is_global_ref {
-                    bound.insert(v.name.clone());
-                }
-            });
-        }
-    }
-    let mut groundable = true;
-    for fact in branch {
-        fact.visit_vars(&mut |_, v| {
-            if !v.is_global_ref && !bound.contains(&v.name) {
-                groundable = false;
-            }
-        });
-    }
-    groundable
 }
 
 /// Expands one `or` branch (a conjunction of facts that may itself contain

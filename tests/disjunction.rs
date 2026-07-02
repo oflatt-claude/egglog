@@ -262,60 +262,73 @@ fn or_in_rewrite_condition() -> Result<(), Error> {
 ")
 }
 
-/// A *correlated* `or` whose branches each equate an outer column with a
-/// variable bound elsewhere in the surrounding conjunction — the e-graph
-/// rebuild pattern. Every branch references the outer-bound `a`/`b`/`c` (from
-/// `v`) and `d` (from the seminaive delta atom `u`); a `(!= d e)` primitive
-/// sits in the conjunction beside the `or`. The action reads another table
-/// (`f`) by function lookup. Under `:unsafe-seminaive` this must fire exactly
-/// for `v`-rows that mention a `u`-key in some column (with `d != e`).
+/// Correlated deduplicating rebuild (e-graph rebuild shape). The surrounding
+/// conjunction binds the row `(v a b c)`; each `or` branch references an outer
+/// column and probes a staleness relation `stale` on it, binding a branch-local
+/// leader. The row is rebuilt via a `leader` function lookup. A row stale in
+/// *two* columns matches two branches, but the fused deduplicating union keys on
+/// the shared output row `(a b c)`, so the action fires **exactly once** — the
+/// disjunctive-semijoin single-rebuild guarantee (not once per stale column,
+/// which is what rule-splitting would do). `fire` counts firings via `(+)`.
 #[test]
-fn or_correlated_seminaive_rebuild() -> Result<(), Error> {
+fn or_correlated_dedup_single_rebuild() -> Result<(), Error> {
     run("
 (relation v (i64 i64 i64))
-(relation u (i64 i64))
-(function f (i64) i64 :merge (max old new))
-(relation hit (i64 i64 i64))
+(relation stale (i64 i64))       ; (term, leader) for non-canonical terms
+(function leader (i64) i64 :merge (max old new))
+(function fire (i64 i64 i64) i64 :merge (+ old new))
+(relation rebuilt (i64 i64 i64))
 
-(set (f 1) 10) (set (f 2) 20) (set (f 3) 30)
-(set (f 4) 40) (set (f 5) 50) (set (f 6) 60)
-(set (f 7) 70) (set (f 9) 90)
+(set (leader 1) 11) (set (leader 2) 22) (set (leader 3) 3)
+(set (leader 4) 4) (set (leader 5) 55) (set (leader 6) 6)
+(stale 1 11) (stale 2 22) (stale 5 55)
 
-(v 1 2 3)
-(v 4 5 6)
-(v 7 7 9)
-
-(u 2 8)   ; d=2, e=8: hits (v 1 2 3) via column b
-(u 9 8)   ; d=9, e=8: hits (v 7 7 9) via column c
-(u 5 5)   ; d=e=5: filtered out by (!= d e), so (v 4 5 6) is not hit
+(v 1 2 3)   ; columns 1 AND 2 are stale -> matched by two branches
+(v 4 5 6)   ; only column 5 stale -> one branch
+(v 4 4 4)   ; nothing stale -> no branch
 
 (ruleset rr)
-(rule ((v a b c) (u d e) (!= d e) (OR (= a d) (= b d) (= c d)))
-      ((hit (f a) (f b) (f c)))
+(rule ((v a b c)
+       (OR ((stale a al)) ((stale b bl)) ((stale c cl))))
+      ((set (fire a b c) 1)
+       (rebuilt (leader a) (leader b) (leader c)))
       :ruleset rr :unsafe-seminaive)
-(run rr 10)
+(run rr 1)
 
-(check (hit 10 20 30))
-(check (hit 70 70 90))
-(fail (check (hit 40 50 60)))
+; row stale in two columns fires ONCE (dedup), not twice
+(check (= (fire 1 2 3) 1))
+(check (= (fire 4 5 6) 1))
+(fail (check (= (fire 4 4 4) 1)))
+; action ran and used the leader-function lookups
+(check (rebuilt 11 22 3))
+(check (rebuilt 4 55 6))
 ")
 }
 
-/// The same correlated pattern in plain (naive) mode also compiles by splitting
-/// and produces the correct fixpoint.
+/// A correlated dedup union whose action reads another table by function lookup
+/// (as in the real rebuild) and rewrites the row to its canonical form,
+/// deleting the stale one; run to a fixpoint.
 #[test]
-fn or_correlated_naive() -> Result<(), Error> {
+fn or_correlated_rebuild_to_fixpoint() -> Result<(), Error> {
     run("
 (relation v (i64 i64 i64))
-(relation u (i64 i64))
-(relation hit (i64 i64 i64))
-(v 1 2 3)
-(v 4 5 6)
-(u 2 8)
-(rule ((v a b c) (u d e) (OR (= a d) (= b d) (= c d)))
-      ((hit a b c)))
-(run 5)
-(check (hit 1 2 3))
-(fail (check (hit 4 5 6)))
+(relation stale (i64 i64))
+(function leader (i64) i64 :merge (max old new))
+
+(set (leader 1) 2) (set (leader 2) 2) (set (leader 3) 3)
+(stale 1 2)   ; term 1 is non-canonical, leader 2
+
+(v 1 1 3)     ; stale in columns 0 and 1
+
+(ruleset rr)
+(rule ((v a b c)
+       (OR ((stale a al)) ((stale b bl)) ((stale c cl))))
+      ((v (leader a) (leader b) (leader c))
+       (delete (v a b c)))
+      :ruleset rr :unsafe-seminaive)
+(run rr 3)
+
+(check (v 2 2 3))
+(fail (check (v 1 1 3)))
 ")
 }
