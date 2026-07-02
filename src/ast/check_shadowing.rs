@@ -103,16 +103,27 @@ impl Names {
             }
         }
 
+        fn collect_fact_names(fact: &ResolvedFact, out: &mut HashMap<String, Span>) {
+            match fact {
+                ResolvedFact::Eq(_span, e1, e2) => {
+                    collect_expr_names(e1, out);
+                    collect_expr_names(e2, out);
+                }
+                ResolvedFact::Fact(e) => collect_expr_names(e, out),
+                ResolvedFact::Or(_span, branches) => {
+                    for branch in branches {
+                        for fact in branch {
+                            collect_fact_names(fact, out);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut collected = HashMap::default();
 
         for fact in query {
-            match fact {
-                ResolvedFact::Eq(_span, e1, e2) => {
-                    collect_expr_names(e1, &mut collected);
-                    collect_expr_names(e2, &mut collected);
-                }
-                ResolvedFact::Fact(e) => collect_expr_names(e, &mut collected),
-            }
+            collect_fact_names(fact, &mut collected);
         }
 
         for (name, span) in collected {

@@ -68,6 +68,22 @@ fn proof_form_fact(
         GenericFact::Fact(generic_expr) => {
             GenericFact::Fact(proof_form_expr(generic_expr, res, fresh))
         }
+        GenericFact::Or(span, branches) => {
+            // Normalize each branch independently, keeping any lifted helper
+            // facts inside their branch's conjunction.
+            let new_branches = branches
+                .into_iter()
+                .map(|branch| {
+                    let mut branch_res = vec![];
+                    for fact in branch {
+                        let rewritten = proof_form_fact(fact, &mut branch_res, fresh);
+                        branch_res.push(rewritten);
+                    }
+                    branch_res
+                })
+                .collect();
+            GenericFact::Or(span, new_branches)
+        }
     }
 }
 

@@ -35,6 +35,11 @@ pub enum GenericExpr<Head, Leaf> {
 pub enum GenericFact<Head, Leaf> {
     Eq(Span, GenericExpr<Head, Leaf>, GenericExpr<Head, Leaf>),
     Fact(GenericExpr<Head, Leaf>),
+    /// A disjunction `(or (branch...) (branch...) ...)`. Each branch is a
+    /// conjunction (list) of facts. The disjunction matches when at least one
+    /// branch matches. Only variables common to every branch (plus variables
+    /// bound by the surrounding conjunction) are visible outside the `or`.
+    Or(Span, Vec<Vec<GenericFact<Head, Leaf>>>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

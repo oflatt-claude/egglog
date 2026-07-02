@@ -23,6 +23,11 @@ macro_rules! span {
 // differently to different parse errors. The benefit of this is that
 // error messages are defined in the same place that they are created,
 // making it easier to improve errors over time.
+/// The head symbols for a disjunction fact `(or (branch...) ...)`. Both the
+/// lowercase `or` and the uppercase `OR` spellings are accepted.
+pub const OR_HEAD: &str = "or";
+pub const OR_HEAD_UPPER: &str = "OR";
+
 #[derive(Debug, Error)]
 pub struct ParseError(pub Span, pub String);
 
@@ -906,6 +911,29 @@ impl Parser {
                 [e1, e2] => Fact::Eq(span, self.parse_expr(e1)?, self.parse_expr(e2)?),
                 _ => return error!(span, "usage: (= <expr> <expr>)"),
             },
+            OR_HEAD | OR_HEAD_UPPER => {
+                // Each disjunct is either a parenthesized conjunction of facts
+                // `((A x) (B x))` or a single bare fact `(= a d)` / `(A x)`. A
+                // conjunction is recognized by being an empty list or a list
+                // whose first element is itself a list (a nested fact); anything
+                // else is a call with a symbol head, i.e. one fact.
+                let mut branches = Vec::with_capacity(tail.len());
+                for branch_sexp in tail {
+                    let is_conjunction = matches!(
+                        branch_sexp,
+                        Sexp::List(elems, _)
+                            if elems.is_empty() || matches!(elems.first(), Some(Sexp::List(..)))
+                    );
+                    let branch = if is_conjunction {
+                        let facts = branch_sexp.expect_list("or branch (a list of facts)")?;
+                        map_fallible(facts, self, Self::parse_fact)?
+                    } else {
+                        vec![self.parse_fact(branch_sexp)?]
+                    };
+                    branches.push(branch);
+                }
+                Fact::Or(span, branches)
+            }
             _ => Fact::Fact(self.parse_expr(sexp)?),
         })
     }

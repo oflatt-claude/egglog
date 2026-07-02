@@ -38,7 +38,7 @@ pub(crate) mod rule;
 #[cfg(test)]
 mod tests;
 
-pub use rule::{Function, QueryEntry, RuleBuilder};
+pub use rule::{AtomId, Function, QueryEntry, RuleBuilder, Variable};
 use thiserror::Error;
 
 /// A live registry of action handles for use by typed primitives.

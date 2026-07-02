@@ -1128,6 +1128,31 @@ pub(crate) trait ResolvedRuleExt {
         fresh_gen: &mut SymbolGen,
         union_to_set_optimization: bool,
     ) -> Result<ResolvedCoreRule, TypeError>;
+
+    /// Like [`Self::to_canonicalized_core_rule`] but skips the groundedness
+    /// check. Used to flatten a single branch of an `or` in isolation, where a
+    /// variable may be grounded by the surrounding conjunction rather than by
+    /// the branch itself.
+    fn to_canonicalized_core_rule_ungrounded(
+        &self,
+        typeinfo: &TypeInfo,
+        fresh_gen: &mut SymbolGen,
+        union_to_set_optimization: bool,
+    ) -> Result<ResolvedCoreRule, TypeError>;
+
+    /// Like [`Self::to_canonicalized_core_rule_ungrounded`] but treats the given
+    /// variable names as already bound when lowering the actions (in addition to
+    /// the query's own variables). Used for the surrounding conjunction of an
+    /// `or`: the `or`'s output variables are bound by the fused union at
+    /// runtime, so the actions may reference them even though they do not appear
+    /// in the conjunction's own atoms.
+    fn to_canonicalized_core_rule_extra_binding(
+        &self,
+        typeinfo: &TypeInfo,
+        fresh_gen: &mut SymbolGen,
+        union_to_set_optimization: bool,
+        extra_binding: &[ResolvedVar],
+    ) -> Result<ResolvedCoreRule, TypeError>;
 }
 
 impl ResolvedRuleExt for ResolvedRule {
@@ -1157,6 +1182,60 @@ impl ResolvedRuleExt for ResolvedRule {
 
         let rule = rule.remove_dup_vars(value_eq);
 
+        Ok(rule)
+    }
+
+    fn to_canonicalized_core_rule_ungrounded(
+        &self,
+        typeinfo: &TypeInfo,
+        fresh_gen: &mut SymbolGen,
+        union_to_set_optimization: bool,
+    ) -> Result<ResolvedCoreRule, TypeError> {
+        let value_eq = &typeinfo.get_prims("value-eq").unwrap()[0];
+        let value_eq = |at1: &ResolvedAtomTerm, at2: &ResolvedAtomTerm| {
+            ResolvedCall::Primitive(SpecializedPrimitive {
+                prim_with_id: value_eq.clone(),
+                input: vec![at1.output(), at2.output()],
+                output: UnitSort.to_arcsort(),
+            })
+        };
+        let rule = self.to_core_rule(typeinfo, fresh_gen, union_to_set_optimization)?;
+        let rule = rule.canonicalize(&value_eq);
+        let rule = rule.remove_dup_vars(value_eq);
+        Ok(rule)
+    }
+
+    fn to_canonicalized_core_rule_extra_binding(
+        &self,
+        typeinfo: &TypeInfo,
+        fresh_gen: &mut SymbolGen,
+        union_to_set_optimization: bool,
+        extra_binding: &[ResolvedVar],
+    ) -> Result<ResolvedCoreRule, TypeError> {
+        let value_eq = &typeinfo.get_prims("value-eq").unwrap()[0];
+        let value_eq = |at1: &ResolvedAtomTerm, at2: &ResolvedAtomTerm| {
+            ResolvedCall::Primitive(SpecializedPrimitive {
+                prim_with_id: value_eq.clone(),
+                input: vec![at1.output(), at2.output()],
+                output: UnitSort.to_arcsort(),
+            })
+        };
+
+        let (body, _correspondence) = Facts(self.body.clone()).to_query(typeinfo, fresh_gen);
+        let mut binding = body.get_vars();
+        for var in extra_binding {
+            binding.insert(var.clone());
+        }
+        let mut ctx =
+            CoreActionContext::new(typeinfo, &mut binding, fresh_gen, union_to_set_optimization);
+        let (head, _correspondence) = self.head.to_core_actions(&mut ctx)?;
+        let rule = GenericCoreRule {
+            span: self.span.clone(),
+            body,
+            head,
+        };
+        let rule = rule.canonicalize(&value_eq);
+        let rule = rule.remove_dup_vars(value_eq);
         Ok(rule)
     }
 }

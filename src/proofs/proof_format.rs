@@ -544,6 +544,9 @@ impl ProofStore {
             ResolvedFact::Fact(expr) => {
                 self.unify_expr(expr, proof.rhs(), subst);
             }
+            ResolvedFact::Or(..) => {
+                panic!("`or` facts are not supported with proofs")
+            }
         }
     }
 

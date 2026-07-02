@@ -970,6 +970,9 @@ impl ProofStore {
 
                 Ok(())
             }
+            ResolvedFact::Or(..) => {
+                panic!("`or` facts are not supported with proofs")
+            }
         }
     }
 

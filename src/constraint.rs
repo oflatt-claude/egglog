@@ -570,6 +570,13 @@ impl Assignment<AtomTerm, ArcSort> {
                 self.annotate_expr(e2, typeinfo, ctx),
             ),
             GenericFact::Fact(expr) => ResolvedFact::Fact(self.annotate_expr(expr, typeinfo, ctx)),
+            GenericFact::Or(span, branches) => ResolvedFact::Or(
+                span.clone(),
+                branches
+                    .iter()
+                    .map(|branch| self.annotate_facts(branch, typeinfo, ctx))
+                    .collect(),
+            ),
         }
     }
 

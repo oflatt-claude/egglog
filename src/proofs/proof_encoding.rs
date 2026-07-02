@@ -794,6 +794,25 @@ impl<'a> ProofInstrumentor<'a> {
                 let (_, proof) = self.instrument_fact_expr(generic_expr, res, action_lookups);
                 proof
             }
+            ResolvedFact::Or(_, branches) => {
+                // `or` is supported under the term encoding only without proofs:
+                // each branch's atoms are rewritten to view-table lookups and
+                // re-emitted as an `(or (branch...) ...)` fact. Proof tracking
+                // through a disjunction is not supported.
+                if self.egraph.proof_state.proofs_enabled {
+                    panic!("`or` facts are not supported with proofs")
+                }
+                let mut branch_strs = Vec::with_capacity(branches.len());
+                for branch in branches {
+                    let mut branch_res = vec![];
+                    for fact in branch {
+                        self.instrument_fact(fact, &mut branch_res, action_lookups);
+                    }
+                    branch_strs.push(format!("({})", ListDisplay(&branch_res, " ")));
+                }
+                res.push(format!("(or {})", ListDisplay(&branch_strs, " ")));
+                "()".to_string()
+            }
         }
     }
 

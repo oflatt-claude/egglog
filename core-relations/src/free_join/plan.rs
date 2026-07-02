@@ -60,7 +60,7 @@ use crate::{
     common::{HashMap, HashSet, IndexSet},
     offsets::Subset,
     pool::Pooled,
-    query::{Atom, Query, VarColumnMap},
+    query::{Atom, Query, UnionSpec, VarColumnMap},
     table_spec::Constraint,
 };
 
@@ -154,6 +154,24 @@ pub(crate) enum JoinStage {
         bind: SmallVec<[(ColumnId, Variable); 2]>,
         to_intersect: Vec<(ScanSpec, SmallVec<[ColumnId; 2]>)>,
     },
+    /// A fused disjunction (`or`). Each branch is a self-contained sub-plan over
+    /// its own atoms. At runtime every branch is enumerated, and each branch
+    /// match is handed to the enclosing block's materializer, which keys it on
+    /// the union's output variables (the block's [`MatSpec::msg_vars`]) —
+    /// deduplicating them. The surrounding conjunction is then joined once, in
+    /// the plan's result block, against that materialization via the atoms'
+    /// indexes rather than being re-scanned per branch. `Union` is only ever
+    /// emitted as the lone stage of a materialization block.
+    Union { branches: Vec<UnionBranch> },
+}
+
+/// One branch of a [`JoinStage::Union`]: a self-contained sub-plan over the
+/// branch's own atoms.
+#[derive(Debug, Clone)]
+pub(crate) struct UnionBranch {
+    pub atoms: Arc<DenseIdMap<AtomId, Atom>>,
+    pub header: Vec<JoinHeader>,
+    pub stages: JoinStages,
 }
 
 /// Merge every `FusedIntersect { to_intersect: [] }` into the first earlier such stage on the
@@ -374,6 +392,9 @@ impl SinglePlan {
                     to_intersect: _,
                 } => {
                     todo!("materialization")
+                }
+                JoinStage::Union { .. } => {
+                    todo!("union")
                 }
             };
             let next = if i == self.stages.instrs.len() - 1 {
@@ -1180,6 +1201,146 @@ pub(crate) fn tree_decompose_and_plan(
     })
 }
 
+/// Builds a `PlanningContext` restricted to `atom_ids`, keeping only the
+/// variables that occur in those atoms and trimming each variable's
+/// occurrences to those atoms.
+fn restrict_context<'a>(ctx: &PlanningContext<'a>, atom_ids: &[AtomId]) -> PlanningContext<'a> {
+    let atoms: DenseIdMap<AtomId, Atom> = atom_ids
+        .iter()
+        .map(|id| (*id, ctx.atoms[*id].clone()))
+        .collect();
+    let mut vars = DenseIdMap::new();
+    for (var, vinfo) in ctx.vars.iter() {
+        let mut vinfo = vinfo.clone();
+        vinfo.occurrences.retain(|occ| atoms.contains_key(occ.atom));
+        if !vinfo.occurrences.is_empty() {
+            vars.insert(var, vinfo);
+        }
+    }
+    PlanningContext {
+        vars,
+        atoms,
+        fun_deps: ctx.fun_deps.clone(),
+        col_est: ctx.col_est.clone(),
+    }
+}
+
+/// Plans a query containing a disjunction (`or`) as a fused union. The result is
+/// a [`DecomposedPlan`] with a single block — a [`JoinStage::Union`] that
+/// enumerates every branch and materializes the `output_vars` (deduplicated) —
+/// followed by a result block that joins the surrounding conjunction against
+/// that materialization exactly once. See [`JoinStage::Union`].
+fn plan_union(
+    ctx: PlanningContext,
+    strat: PlanStrategy,
+    actions: ActionId,
+    spec: UnionSpec,
+) -> Plan {
+    let UnionSpec {
+        branch_atoms,
+        output_vars,
+    } = spec;
+
+    // Plan each branch over its own atoms. Every output variable must be bound
+    // by the branch (so it can be materialized), even if the branch itself does
+    // not otherwise use it, so mark them as used.
+    let branches: Vec<UnionBranch> = branch_atoms
+        .iter()
+        .map(|atom_ids| {
+            let mut branch_ctx = restrict_context(&ctx, atom_ids);
+            for var in output_vars.iter() {
+                if let Some(vinfo) = branch_ctx.vars.get_mut(*var) {
+                    vinfo.used_in_rhs = true;
+                }
+            }
+            let (header, instrs) = plan_stages(&branch_ctx, strat);
+            UnionBranch {
+                atoms: Arc::new(branch_ctx.atoms),
+                header,
+                stages: JoinStages {
+                    instrs: Arc::new(instrs),
+                },
+            }
+        })
+        .collect();
+
+    let output_vars: SmallVec<[Variable; 8]> = output_vars.into_iter().collect();
+
+    // Block 0 is the union: a lone `Union` stage whose "action" (when run as a
+    // materialization block) keys the branch outputs on `output_vars`.
+    let union_stages = JoinStages {
+        instrs: Arc::new(vec![JoinStage::Union { branches }]),
+    };
+    let union_spec = MatSpec {
+        msg_vars: output_vars.iter().copied().collect(),
+        val_vars: smallvec![],
+    };
+    let blocks = vec![(union_stages, union_spec)];
+
+    // The continuation joins the atoms not in any branch, receiving
+    // `output_vars` as message variables from block 0. `plan_single_bag`
+    // produces exactly this: a prologue that scans the materialization and
+    // probes the continuation atoms by `output_vars`, followed by the join of
+    // the remaining continuation variables. Running those stages as the result
+    // block (with the rule's action) fires the action per match.
+    let cont_atom_ids: Vec<AtomId> = ctx
+        .atoms
+        .iter()
+        .map(|(id, _)| id)
+        .filter(|id| !branch_atoms.iter().any(|b| b.contains(id)))
+        .collect();
+    let mut cont_ctx = restrict_context(&ctx, &cont_atom_ids);
+    // The continuation must know about `output_vars` so the message-var prologue
+    // can match, even for output vars that appear only in the branches.
+    for var in output_vars.iter() {
+        if !cont_ctx.vars.contains_key(*var) {
+            cont_ctx.vars.insert(
+                *var,
+                VarInfo {
+                    occurrences: Default::default(),
+                    used_in_rhs: true,
+                    defined_in_rhs: false,
+                    name: None,
+                },
+            );
+        }
+    }
+
+    let mut n_used_in_bag = count_variable_usage_per_bag(std::slice::from_ref(&cont_ctx));
+    // Bump usage for output vars so `plan_single_bag` treats them as coming from
+    // the (single) prior block rather than pruning them.
+    for var in output_vars.iter() {
+        let count = n_used_in_bag.get_or_default(*var);
+        *count += 1;
+    }
+    let mut has_block_contributed = vec![false];
+    let (cont_header, result_block, _cont_spec) = plan_single_bag(
+        &mut cont_ctx,
+        &blocks,
+        &mut has_block_contributed,
+        &mut n_used_in_bag,
+        strat,
+    );
+
+    let blocks = blocks
+        .into_iter()
+        .map(|(stages, mat_spec)| (loop_lifting(stages), mat_spec))
+        .collect::<Vec<_>>();
+    let result_block = loop_lifting(result_block);
+
+    // The plan's atom set is the continuation atoms only; each branch carries
+    // its own atoms inside the `Union` stage. This keeps the execution-time
+    // `BindingInfo` (seeded from these atoms) free of branch atoms, so an empty
+    // branch relation does not abort the whole rule.
+    Plan::DecomposedPlan(DecomposedPlan {
+        atoms: Arc::new(cont_ctx.atoms),
+        header: cont_header,
+        stages: JoinStageBlocks { blocks },
+        result_block,
+        actions,
+    })
+}
+
 pub(crate) fn plan_query<'a>(query: Query, col_est: ColumnCardEst<'a>) -> Plan {
     let atoms = query.atoms;
     let ctx = PlanningContext {
@@ -1188,6 +1349,9 @@ pub(crate) fn plan_query<'a>(query: Query, col_est: ColumnCardEst<'a>) -> Plan {
         fun_deps: Arc::new(query.fun_deps),
         col_est,
     };
+    if let Some(union) = query.union {
+        return plan_union(ctx, query.plan_strategy, query.action, union);
+    }
     tree_decompose_and_plan(ctx, query.plan_strategy, query.action, query.no_decomp)
 }
 
