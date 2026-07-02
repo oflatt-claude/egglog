@@ -23,7 +23,9 @@ pub use parse::*;
 #[derive(Clone, Debug)]
 /// The egglog internal representation of already compiled rules
 pub(crate) enum Ruleset {
-    /// Represents a ruleset with a set of rules.
+    /// Represents a ruleset with a set of rules. Each named rule compiles to a
+    /// single backend rule (a rule whose body contains `or` uses a fused union
+    /// node, still a single backend rule).
     Rules(IndexMap<String, (ResolvedCoreRule, egglog_bridge::RuleId)>),
     /// A combined ruleset may contain other rulesets.
     Combined(Vec<String>),
@@ -1426,6 +1428,21 @@ where
                     let (child_atoms, expr) = expr.to_query(typeinfo, fresh_gen);
                     atoms.extend(child_atoms);
                     new_body.push(GenericFact::Fact(expr));
+                }
+                GenericFact::Or(span, branches) => {
+                    // Flatten each branch into atoms of the shared query so the
+                    // constraint solver infers a sort for every variable
+                    // (common vars and the already-renamed branch-locals).
+                    // Branch-local renaming happens upstream in
+                    // `typecheck_rule` before `to_query` is called.
+                    let mut mapped_branches = Vec::with_capacity(branches.len());
+                    for branch in branches {
+                        let (branch_query, mapped_branch) =
+                            Facts(branch.clone()).to_query(typeinfo, fresh_gen);
+                        atoms.extend(branch_query.atoms);
+                        mapped_branches.push(mapped_branch);
+                    }
+                    new_body.push(GenericFact::Or(span.clone(), mapped_branches));
                 }
             }
         }

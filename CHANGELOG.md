@@ -2,6 +2,7 @@
 
 ## [Unreleased] - ReleaseDate
 
+- **Disjunction (`or`) in rule bodies.** A rule body may now contain `(or (branch...) (branch...) ...)`, where each branch is a conjunction of facts; the disjunction matches when at least one branch matches. Only variables common to every branch (plus variables bound by the surrounding conjunction) are visible outside the `or`; a branch-local variable that escapes its `or`, and an empty branch, are type errors. `or` is only allowed in rule bodies (including `rewrite` conditions), not in query-shaped commands like `check`. It compiles to a single rule with a fused union node in the free-join engine: the surrounding conjunction is scanned once and joined against the deduplicated union of the branch outputs (no rule-splitting, no materialized table). `or` rules run in naive mode, and a branch must contain only table atoms. See `docs/disjunction-design.md`.
 - Add typed `EGraph` extension state that clones with `EGraph` and is restored by `push`/`pop`.
 - Report full source file paths in egglog span and error messages.
 - Fix seminaive matching after nested containers rebuild in place by propagating dirty container ids through parent containers.

@@ -23,6 +23,9 @@ macro_rules! span {
 // differently to different parse errors. The benefit of this is that
 // error messages are defined in the same place that they are created,
 // making it easier to improve errors over time.
+/// The head symbol for a disjunction fact `(or (branch...) ...)`.
+pub const OR_HEAD: &str = "or";
+
 #[derive(Debug, Error)]
 pub struct ParseError(pub Span, pub String);
 
@@ -906,6 +909,16 @@ impl Parser {
                 [e1, e2] => Fact::Eq(span, self.parse_expr(e1)?, self.parse_expr(e2)?),
                 _ => return error!(span, "usage: (= <expr> <expr>)"),
             },
+            OR_HEAD => {
+                // `(or (branch...) (branch...) ...)`: each branch is a
+                // parenthesized list of facts.
+                let mut branches = Vec::with_capacity(tail.len());
+                for branch_sexp in tail {
+                    let facts = branch_sexp.expect_list("or branch (a list of facts)")?;
+                    branches.push(map_fallible(facts, self, Self::parse_fact)?);
+                }
+                Fact::Or(span, branches)
+            }
             _ => Fact::Fact(self.parse_expr(sexp)?),
         })
     }

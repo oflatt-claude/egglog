@@ -120,6 +120,14 @@ pub(crate) struct Query {
     /// If `true`, skip tree-decomposition during query planning. See
     /// [`core_relations::QueryBuilder::set_no_decomp`].
     no_decomp: bool,
+    /// A disjunction (`or`) in this rule's query, if any. Each element of
+    /// `branch_atoms` lists the [`AtomId`]s (returned by `query_table` /
+    /// `query_prim`-style atom builders) that belong to one branch; every atom
+    /// not listed is a "continuation" atom of the surrounding conjunction.
+    /// `output_vars` are the variables the branches bind that flow into the
+    /// continuation and the action (the variables common to every branch). See
+    /// [`core_relations::QueryBuilder::set_union`].
+    union: Option<(Vec<Vec<AtomId>>, Vec<VariableId>)>,
 }
 
 pub struct RuleBuilder<'a> {
@@ -151,6 +159,7 @@ impl EGraph {
                 add_rule: Default::default(),
                 plan_strategy: Default::default(),
                 no_decomp: false,
+                union: None,
             },
         }
     }
@@ -192,6 +201,26 @@ impl RuleBuilder<'_> {
     /// `:no-decomp` rule option or the egglog `--no-decomp` CLI flag.
     pub fn set_no_decomp(&mut self, no_decomp: bool) {
         self.query.no_decomp = no_decomp;
+    }
+
+    /// Mark this rule's query as a fused disjunction (`or`). `branch_atoms[i]`
+    /// are the [`AtomId`]s belonging to branch `i` (as returned by the atom
+    /// builders such as `query_table`); every atom not listed is a
+    /// "continuation" atom of the surrounding conjunction. `output_vars` are the
+    /// variables the branches bind that the continuation and the action may read
+    /// (the variables common to every branch). See
+    /// [`core_relations::QueryBuilder::set_union`].
+    ///
+    /// A union rule is run in naive mode (seminaive delta through a union is not
+    /// supported), so callers should construct it via
+    /// `new_rule(desc, /* seminaive */ false)`.
+    pub fn set_union_branches(
+        &mut self,
+        branch_atoms: Vec<Vec<AtomId>>,
+        output_vars: Vec<Variable>,
+    ) {
+        let output_var_ids = output_vars.into_iter().map(|v| v.id).collect();
+        self.query.union = Some((branch_atoms, output_var_ids));
     }
 
     /// Get the canonical value of an id in the union-find. An internal-only
@@ -763,6 +792,29 @@ impl Query {
         let mut atom_mapping = Vec::with_capacity(self.atoms.len());
         for (table, entries, _schema_info) in &self.atoms {
             atom_mapping.push(add_atom(&mut qb, *table, entries, &[], &mut inner)?);
+        }
+        if let Some((branch_atoms, output_var_ids)) = &self.union {
+            // Translate the high-level atom indices / variable ids into the
+            // core-relations atom ids / variables allocated above.
+            let core_branches: Vec<Vec<core_relations::AtomId>> = branch_atoms
+                .iter()
+                .map(|branch| {
+                    branch
+                        .iter()
+                        .map(|atom| atom_mapping[atom.index()])
+                        .collect()
+                })
+                .collect();
+            let core_output_vars: Vec<core_relations::Variable> = output_var_ids
+                .iter()
+                .map(|id| match inner.mapping[*id] {
+                    DstVar::Var(v) => v,
+                    DstVar::Const(_) => {
+                        panic!("union output variable must be a query variable, not a constant")
+                    }
+                })
+                .collect();
+            qb.set_union(core_branches, core_output_vars);
         }
         let rule_id = self.run_rules_and_build(qb, inner, desc)?;
         let rs = rsb.build();

@@ -126,6 +126,7 @@ impl<'outer> RuleSetBuilder<'outer> {
                 plan_strategy: Default::default(),
                 fun_deps: Default::default(),
                 no_decomp: false,
+                union: None,
             },
         }
     }
@@ -304,6 +305,24 @@ impl<'outer, 'a> QueryBuilder<'outer, 'a> {
     /// for query decomposition and always use evaluate the query as a single bag.
     pub fn set_no_decomp(&mut self, no_decomp: bool) {
         self.query.no_decomp = no_decomp;
+    }
+
+    /// Mark this query as a fused disjunction (`or`). `branch_atoms[i]` are the
+    /// [`AtomId`]s (as returned by [`add_atom`](Self::add_atom)) belonging to
+    /// branch `i`; every atom not listed in any branch is a "continuation"
+    /// atom, joined once against each branch output. `output_vars` are the
+    /// variables the branches bind that the continuation and action may read
+    /// (the variables common to every branch).
+    ///
+    /// A union query is always planned as a single bag (tree-decomposition is
+    /// skipped), and is intended to be run in naive mode (seminaive delta
+    /// through a union is not supported).
+    pub fn set_union(&mut self, branch_atoms: Vec<Vec<AtomId>>, output_vars: Vec<Variable>) {
+        self.query.no_decomp = true;
+        self.query.union = Some(UnionSpec {
+            branch_atoms,
+            output_vars,
+        });
     }
 
     /// Create a new variable of the given type.
@@ -1048,4 +1067,23 @@ pub(crate) struct Query {
     /// [`crate::free_join::plan::tree_decompose_and_plan`]. Set via
     /// [`QueryBuilder::set_no_decomp`].
     pub(crate) no_decomp: bool,
+    /// A disjunction (`or`) in the query, if present. See [`UnionSpec`] and
+    /// [`QueryBuilder::set_union`]. When set, the query is planned as a fused
+    /// union: each branch is planned over its own atoms and enumerated at
+    /// runtime to produce the `output_vars`, and the remaining
+    /// ("continuation") atoms are joined against those bindings exactly once.
+    pub(crate) union: Option<UnionSpec>,
+}
+
+/// Describes a disjunction (`or`) embedded in a query. The atoms of each branch
+/// and the "continuation" atoms (everything not in a branch) share one atom /
+/// variable namespace. `output_vars` are the variables a branch binds that the
+/// continuation and action may use — the variables common to every branch.
+#[derive(Debug, Clone)]
+pub(crate) struct UnionSpec {
+    /// The atoms belonging to each branch of the disjunction.
+    pub(crate) branch_atoms: Vec<Vec<AtomId>>,
+    /// The variables produced by the union (common to every branch) that flow
+    /// into the continuation and the action.
+    pub(crate) output_vars: Vec<Variable>,
 }

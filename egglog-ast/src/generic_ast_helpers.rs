@@ -98,6 +98,13 @@ impl<Head: Display, Leaf: Display> Display for GenericFact<Head, Leaf> {
         match self {
             GenericFact::Eq(_, e1, e2) => write!(f, "(= {e1} {e2})"),
             GenericFact::Fact(expr) => write!(f, "{expr}"),
+            GenericFact::Or(_, branches) => {
+                write!(f, "(or")?;
+                for branch in branches {
+                    write!(f, " ({})", ListDisplay(branch, " "))?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -533,6 +540,13 @@ where
                 GenericFact::Eq(span, e1.visit_exprs(f), e2.visit_exprs(f))
             }
             GenericFact::Fact(expr) => GenericFact::Fact(expr.visit_exprs(f)),
+            GenericFact::Or(span, branches) => GenericFact::Or(
+                span,
+                branches
+                    .into_iter()
+                    .map(|branch| branch.into_iter().map(|fact| fact.visit_exprs(f)).collect())
+                    .collect(),
+            ),
         }
     }
 
@@ -543,6 +557,13 @@ where
         match self {
             GenericFact::Eq(span, e1, e2) => GenericFact::Eq(span.clone(), f(e1), f(e2)),
             GenericFact::Fact(expr) => GenericFact::Fact(f(expr)),
+            GenericFact::Or(span, branches) => GenericFact::Or(
+                span.clone(),
+                branches
+                    .iter()
+                    .map(|branch| branch.iter().map(|fact| fact.map_exprs(f)).collect())
+                    .collect(),
+            ),
         }
     }
 
@@ -575,6 +596,18 @@ where
                 GenericFact::Eq(span, e1.map_symbols(head, leaf), e2.map_symbols(head, leaf))
             }
             GenericFact::Fact(expr) => GenericFact::Fact(expr.map_symbols(head, leaf)),
+            GenericFact::Or(span, branches) => GenericFact::Or(
+                span,
+                branches
+                    .into_iter()
+                    .map(|branch| {
+                        branch
+                            .into_iter()
+                            .map(|fact| fact.map_symbols(head, leaf))
+                            .collect()
+                    })
+                    .collect(),
+            ),
         }
     }
 

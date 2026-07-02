@@ -1800,6 +1800,58 @@ impl<'a> JoinState<'a> {
                     binding_info.move_back(spec.0.to_index.atom, prober);
                 }
             }
+            JoinStage::Union { branches } => {
+                // Fused disjunction. Enumerate every branch independently — each
+                // over its own atoms with a fresh `BindingInfo` — handing each
+                // complete branch match to the same `action`/`action_buf` as the
+                // enclosing plan. In practice a `Union` is the leading stage of a
+                // materialization block, so `action`/`action_buf` accumulate the
+                // branches' `output_vars` into one materialization (deduplicated
+                // on the key). The surrounding conjunction is then joined once,
+                // in the plan's continuation, against that materialization.
+                for branch in branches {
+                    if self.exec_state.should_stop() {
+                        return;
+                    }
+                    let mut branch_bi = BindingInfo::default();
+                    for (id, info) in branch.atoms.iter() {
+                        let table = self.db.get_table(info.table);
+                        branch_bi.insert_subset(id, table.all());
+                    }
+                    // Copy over any bindings the enclosing plan has already
+                    // established (a `Union` is a leading stage today, so this
+                    // is usually empty, but keep it correct for future use).
+                    for (var, val) in binding_info.bindings.iter() {
+                        branch_bi.bindings.insert(var, *val);
+                    }
+                    let mut skip = false;
+                    for JoinHeader { atom, subset, .. } in &branch.header {
+                        if subset.is_empty() {
+                            skip = true;
+                            break;
+                        }
+                        let mut node = Arc::try_unwrap(branch_bi.unwrap_val(*atom)).unwrap();
+                        node.cached_subsets.take();
+                        node.cached_children.take();
+                        node.subset.intersect(subset.as_ref(), &self.pool);
+                        if node.subset.is_empty() {
+                            skip = true;
+                            break;
+                        }
+                        branch_bi.move_back_node(*atom, Arc::new(node));
+                    }
+                    if skip {
+                        continue;
+                    }
+                    self.run_join_stages(
+                        &branch.stages,
+                        &branch.atoms,
+                        action,
+                        &mut branch_bi,
+                        action_buf,
+                    );
+                }
+            }
         }
     }
 }
@@ -2272,6 +2324,9 @@ fn estimate_size(join_stage: &JoinStage, binding_info: &BindingInfo) -> usize {
             .unwrap_or(0),
         JoinStage::FusedIntersect { cover, .. } => binding_info.subsets[cover.to_index.atom].size(),
         JoinStage::FusedIntersectMat { cover, .. } => binding_info.materializations[*cover].len(), // TODO: len() might be expensive.
+        // A `Union` is always a lone leading stage in its block, so its size
+        // estimate is never used to reorder anything.
+        JoinStage::Union { .. } => usize::MAX,
     }
 }
 
@@ -2280,6 +2335,7 @@ fn num_intersected_rels(join_stage: &JoinStage) -> i32 {
         JoinStage::Intersect { scans, .. } => scans.len() as i32,
         JoinStage::FusedIntersect { to_intersect, .. } => to_intersect.len() as i32 + 1,
         JoinStage::FusedIntersectMat { to_intersect, .. } => to_intersect.len() as i32,
+        JoinStage::Union { branches, .. } => branches.len() as i32,
     }
 }
 
@@ -2390,6 +2446,9 @@ fn recompute_leaf_scans(
                         break;
                     }
                 }
+                // A `Union` is always a lone stage in its block, so it never
+                // appears alongside the stages considered here.
+                JoinStage::Union { .. } => {}
             }
         }
         leaf_scans[i] = !blocked;
@@ -2433,6 +2492,7 @@ fn sort_plan_by_size_inner(
                         spec.to_index.vars.len() as i64;
                 });
             }
+            JoinStage::Union { .. } => {}
         }
     }
 
@@ -2459,6 +2519,7 @@ fn sort_plan_by_size_inner(
                 .copied()
                 .unwrap_or_default(),
             JoinStage::FusedIntersectMat { bind, .. } => bind.len() as _,
+            JoinStage::Union { .. } => 0,
         };
         (
             -refine,
@@ -2500,6 +2561,7 @@ fn sort_plan_by_size_inner(
                         spec.to_index.vars.len() as i64;
                 });
             }
+            JoinStage::Union { .. } => {}
         }
     }
 }

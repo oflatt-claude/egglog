@@ -68,6 +68,9 @@ fn proof_form_fact(
         GenericFact::Fact(generic_expr) => {
             GenericFact::Fact(proof_form_expr(generic_expr, res, fresh))
         }
+        GenericFact::Or(..) => {
+            panic!("`or` facts are not supported with proofs")
+        }
     }
 }
 
