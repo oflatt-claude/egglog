@@ -261,3 +261,61 @@ fn or_in_rewrite_condition() -> Result<(), Error> {
 (check (= (Add (Num 1) (Num 2)) (Add (Num 2) (Num 1))))
 ")
 }
+
+/// A *correlated* `or` whose branches each equate an outer column with a
+/// variable bound elsewhere in the surrounding conjunction — the e-graph
+/// rebuild pattern. Every branch references the outer-bound `a`/`b`/`c` (from
+/// `v`) and `d` (from the seminaive delta atom `u`); a `(!= d e)` primitive
+/// sits in the conjunction beside the `or`. The action reads another table
+/// (`f`) by function lookup. Under `:unsafe-seminaive` this must fire exactly
+/// for `v`-rows that mention a `u`-key in some column (with `d != e`).
+#[test]
+fn or_correlated_seminaive_rebuild() -> Result<(), Error> {
+    run("
+(relation v (i64 i64 i64))
+(relation u (i64 i64))
+(function f (i64) i64 :merge (max old new))
+(relation hit (i64 i64 i64))
+
+(set (f 1) 10) (set (f 2) 20) (set (f 3) 30)
+(set (f 4) 40) (set (f 5) 50) (set (f 6) 60)
+(set (f 7) 70) (set (f 9) 90)
+
+(v 1 2 3)
+(v 4 5 6)
+(v 7 7 9)
+
+(u 2 8)   ; d=2, e=8: hits (v 1 2 3) via column b
+(u 9 8)   ; d=9, e=8: hits (v 7 7 9) via column c
+(u 5 5)   ; d=e=5: filtered out by (!= d e), so (v 4 5 6) is not hit
+
+(ruleset rr)
+(rule ((v a b c) (u d e) (!= d e) (OR (= a d) (= b d) (= c d)))
+      ((hit (f a) (f b) (f c)))
+      :ruleset rr :unsafe-seminaive)
+(run rr 10)
+
+(check (hit 10 20 30))
+(check (hit 70 70 90))
+(fail (check (hit 40 50 60)))
+")
+}
+
+/// The same correlated pattern in plain (naive) mode also compiles by splitting
+/// and produces the correct fixpoint.
+#[test]
+fn or_correlated_naive() -> Result<(), Error> {
+    run("
+(relation v (i64 i64 i64))
+(relation u (i64 i64))
+(relation hit (i64 i64 i64))
+(v 1 2 3)
+(v 4 5 6)
+(u 2 8)
+(rule ((v a b c) (u d e) (OR (= a d) (= b d) (= c d)))
+      ((hit a b c)))
+(run 5)
+(check (hit 1 2 3))
+(fail (check (hit 4 5 6)))
+")
+}

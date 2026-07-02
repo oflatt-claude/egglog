@@ -848,16 +848,26 @@ impl TypeInfo {
 
     /// Rewrites the rule body so that every top-level `or`'s branch-local
     /// variables are renamed to fresh names (independently per branch), and
-    /// enforces the interface rule: a branch-local variable must not be used
-    /// outside its `or`.
+    /// enforces the interface rule.
     ///
-    /// Returns the rewritten body. `outside_vars` must be the set of variable
-    /// names visible outside every `or` in this rule (conjunctive-fact vars,
-    /// action vars, and other `or`s' common vars).
+    /// A variable referenced in a branch is classified as:
+    /// - **outer** if it is bound by the surrounding conjunction (`conj_vars`):
+    ///   the branch reference is a correlation to that outer variable, so it is
+    ///   left untouched (a *correlated* branch).
+    /// - **common** if it appears in every branch: visible outside the `or`,
+    ///   left untouched.
+    /// - **branch-local** otherwise: renamed to a fresh name per branch. If such
+    ///   a variable is also used outside the `or` (in the action or another
+    ///   `or`'s common vars) it is an interface violation.
+    ///
+    /// `outside_vars` is the set of variable names visible outside every `or`
+    /// in this rule (conjunctive-fact vars, action vars, and other `or`s' common
+    /// vars). `conj_vars` is the subset bound by the surrounding conjunction.
     fn rename_or_locals(
         &self,
         body: &[Fact],
         outside_vars: &HashSet<String>,
+        conj_vars: &HashSet<String>,
         symbol_gen: &mut SymbolGen,
     ) -> Result<Vec<Fact>, TypeError> {
         let mut new_body = Vec::with_capacity(body.len());
@@ -883,15 +893,15 @@ impl TypeInfo {
 
                     let mut new_branches = Vec::with_capacity(branches.len());
                     for (branch, branch_vars) in branches.iter().zip(&per_branch_vars) {
-                        // Branch-locals are this branch's non-common,
-                        // non-global vars. If any is used outside the `or`,
-                        // that's an interface violation.
                         let mut subst: HashMap<String, GenericExpr<String, String>> =
                             HashMap::default();
                         for v in branch_vars {
-                            if common.contains(v) {
+                            // Common vars and vars bound by the surrounding
+                            // conjunction (correlated branches) stay as-is.
+                            if common.contains(v) || conj_vars.contains(v) {
                                 continue;
                             }
+                            // A branch-local used outside its `or` is illegal.
                             if outside_vars.contains(v) {
                                 return Err(TypeError::OrBranchLocalEscapes(
                                     v.clone(),
@@ -914,16 +924,24 @@ impl TypeInfo {
                                 )
                             })
                             .collect();
-                        // Recurse to rename locals in nested `or`s within
-                        // this branch. Nested-or vars common to the nested
-                        // branches remain visible within the enclosing branch.
+                        // Recurse to rename locals in nested `or`s within this
+                        // branch. Common and sibling-branch vars, plus the
+                        // enclosing conjunction's vars, are all bound relative to
+                        // a nested `or`.
                         let mut branch_outside = outside_vars.clone();
                         branch_outside.extend(common.iter().cloned());
                         for other_set in &per_branch_vars {
                             branch_outside.extend(other_set.iter().cloned());
                         }
-                        let renamed =
-                            self.rename_or_locals(&renamed, &branch_outside, symbol_gen)?;
+                        let mut branch_conj = conj_vars.clone();
+                        branch_conj.extend(common.iter().cloned());
+                        branch_conj.extend(branch_vars.iter().cloned());
+                        let renamed = self.rename_or_locals(
+                            &renamed,
+                            &branch_outside,
+                            &branch_conj,
+                            symbol_gen,
+                        )?;
                         new_branches.push(renamed);
                     }
                     new_body.push(GenericFact::Or(span.clone(), new_branches));
@@ -959,6 +977,9 @@ impl TypeInfo {
         let has_or = body.iter().any(|f| matches!(f, GenericFact::Or(..)));
         let body: Vec<Fact> = if has_or {
             let mut outside_vars = HashSet::default();
+            // Variables bound by the surrounding conjunction (the non-`or`
+            // facts). A branch may correlate with these (e.g. `(= col d)`).
+            let mut conj_vars = HashSet::default();
             for fact in body {
                 match fact {
                     GenericFact::Or(_, branches) => {
@@ -982,7 +1003,8 @@ impl TypeInfo {
                     other => {
                         let mut set = HashSet::default();
                         self.collect_fact_vars(std::slice::from_ref(other), &mut set);
-                        outside_vars.extend(set);
+                        outside_vars.extend(set.iter().cloned());
+                        conj_vars.extend(set);
                     }
                 }
             }
@@ -991,7 +1013,7 @@ impl TypeInfo {
                     outside_vars.insert(v.clone());
                 }
             });
-            self.rename_or_locals(body, &outside_vars, symbol_gen)?
+            self.rename_or_locals(body, &outside_vars, &conj_vars, symbol_gen)?
         } else {
             body.clone()
         };

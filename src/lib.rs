@@ -1158,7 +1158,11 @@ impl EGraph {
             .iter()
             .any(|f| matches!(f, ast::ResolvedFact::Or(..)));
 
-        let (stored_core_rule, rule_id) = if has_or {
+        // Each logical rule normally compiles to one backend rule, keyed by its
+        // name. A correlated / seminaive `or` compiles by *splitting* into one
+        // backend rule per disjunct (all sharing the action); those extra rules
+        // get synthetic names so they can coexist in the ruleset.
+        let compiled: Vec<(String, core::ResolvedCoreRule, egglog_bridge::RuleId)> = if has_or {
             self.add_or_rule(
                 &rule,
                 union_to_set,
@@ -1182,19 +1186,20 @@ impl EGraph {
                 translator.actions(actions)?;
                 translator.build()
             };
-            (core_rule, rule_id)
+            vec![(rule.name.clone(), core_rule, rule_id)]
         };
 
         if let Some(rules) = self.rulesets.get_mut(&rule.ruleset) {
             match rules {
                 Ruleset::Rules(rules) => {
-                    match rules.entry(rule.name.clone()) {
-                        indexmap::map::Entry::Occupied(_) => {
-                            let name = rule.name;
-                            panic!("Rule '{name}' was already present")
-                        }
-                        indexmap::map::Entry::Vacant(e) => e.insert((stored_core_rule, rule_id)),
-                    };
+                    for (name, core_rule, rule_id) in compiled {
+                        match rules.entry(name.clone()) {
+                            indexmap::map::Entry::Occupied(_) => {
+                                panic!("Rule '{name}' was already present")
+                            }
+                            indexmap::map::Entry::Vacant(e) => e.insert((core_rule, rule_id)),
+                        };
+                    }
                     Ok(rule.name)
                 }
                 Ruleset::Combined(_) => Err(Error::CombinedRulesetError(rule.ruleset, rule.span)),
@@ -1204,23 +1209,39 @@ impl EGraph {
         }
     }
 
-    /// Compiles a rule whose body contains one or more `or` facts into a single
-    /// backend rule using a fused union in the free-join engine. The surrounding
-    /// conjunction is joined once against the deduplicated union of the branch
-    /// outputs (see [`egglog_bridge::RuleBuilder::set_union_branches`] and
-    /// `core_relations::QueryBuilder::set_union`). Runs in naive mode.
+    /// Compiles a rule whose body contains one or more `or` facts.
+    ///
+    /// Two strategies:
+    /// - **Fused union (Strategy C).** When every disjunct is *self-groundable*
+    ///   (binds all its own variables with its own table atoms) and the rule is
+    ///   naive, the whole `or` compiles to a single backend rule with a fused
+    ///   union node: the surrounding conjunction is joined once against the
+    ///   deduplicated union of the branch outputs (see
+    ///   [`egglog_bridge::RuleBuilder::set_union_branches`] and
+    ///   `core_relations::QueryBuilder::set_union`).
+    /// - **Splitting (Strategy D).** Otherwise — a *correlated* branch (one that
+    ///   references a variable bound by the surrounding conjunction, e.g.
+    ///   `(= col d)`), or a seminaive rule — the `or` compiles to one backend
+    ///   rule per disjunct, each the surrounding conjunction conjoined with that
+    ///   disjunct and the shared action. Each split rule is an ordinary
+    ///   conjunctive rule, so seminaive evaluation and index-probe joins work
+    ///   normally: a delta on an outer atom drives an index probe of the atom a
+    ///   correlated equality constrains, with no cartesian product.
+    ///
+    /// Returns one `(name, core rule, backend rule id)` per compiled backend
+    /// rule (one for a fused union, one per disjunct when splitting).
     fn add_or_rule(
         &mut self,
         rule: &ast::ResolvedRule,
         union_to_set: bool,
-        _seminaive: bool,
+        seminaive: bool,
         no_decomp: bool,
         requires_read_context: bool,
-    ) -> Result<(core::ResolvedCoreRule, egglog_bridge::RuleId), Error> {
+    ) -> Result<Vec<(String, core::ResolvedCoreRule, egglog_bridge::RuleId)>, Error> {
         // Split the body into the surrounding conjunction and the `or`s, then
-        // form the union's branches as the cartesian product of every `or`'s
-        // branches (each combined branch is a conjunction, with nested `or`s
-        // expanded the same way). A single `or` gives one branch per disjunct.
+        // form the branches as the cartesian product of every `or`'s branches
+        // (each combined branch is a conjunction, with nested `or`s expanded the
+        // same way). A single `or` gives one branch per disjunct.
         let mut conj_facts: Vec<ast::ResolvedFact> = Vec::new();
         let mut combined_branches: Vec<Vec<ast::ResolvedFact>> = vec![vec![]];
         for fact in &rule.body {
@@ -1241,6 +1262,23 @@ impl EGraph {
                 }
                 other => conj_facts.push(other.clone()),
             }
+        }
+
+        // Correlated (non-self-groundable) branches and seminaive rules can't use
+        // C's fused union node (its branches must bind the union's output vars
+        // themselves, and it forces naive mode). Fall back to splitting.
+        let fused_union_ok =
+            !seminaive && combined_branches.iter().all(|b| branch_self_groundable(b));
+        if !fused_union_ok {
+            return self.add_or_rule_split(
+                rule,
+                &conj_facts,
+                &combined_branches,
+                union_to_set,
+                seminaive,
+                no_decomp,
+                requires_read_context,
+            );
         }
 
         // The variables visible outside the `or`s (shared with the surrounding
@@ -1324,7 +1362,63 @@ impl EGraph {
             translator.build()
         };
 
-        Ok((core_conj, rule_id))
+        Ok(vec![(rule.name.clone(), core_conj, rule_id)])
+    }
+
+    /// Strategy D: compile an `or` rule by splitting it into one ordinary
+    /// backend rule per disjunct, each conjoining the surrounding conjunction
+    /// with that disjunct and firing the shared action. See [`Self::add_or_rule`].
+    #[allow(clippy::too_many_arguments)]
+    fn add_or_rule_split(
+        &mut self,
+        rule: &ast::ResolvedRule,
+        conj_facts: &[ast::ResolvedFact],
+        combined_branches: &[Vec<ast::ResolvedFact>],
+        union_to_set: bool,
+        seminaive: bool,
+        no_decomp: bool,
+        requires_read_context: bool,
+    ) -> Result<Vec<(String, core::ResolvedCoreRule, egglog_bridge::RuleId)>, Error> {
+        let mut compiled = Vec::with_capacity(combined_branches.len());
+        for (i, branch) in combined_branches.iter().enumerate() {
+            // Each split rule is `conjunction ∧ branch => action`. Per-branch
+            // canonicalization merges each disjunct's equalities (e.g. `(= col
+            // d)`) independently, so a correlated variable resolves correctly in
+            // both the body and the shared action.
+            let mut body = conj_facts.to_vec();
+            body.extend(branch.iter().cloned());
+            let name = if i == 0 {
+                rule.name.clone()
+            } else {
+                format!("{}__or{i}", rule.name)
+            };
+            let split_rule = ast::ResolvedRule {
+                span: rule.span.clone(),
+                head: rule.head.clone(),
+                body,
+                name: name.clone(),
+                ruleset: rule.ruleset.clone(),
+                eval_mode: rule.eval_mode,
+                no_decomp: rule.no_decomp,
+                include_subsumed: rule.include_subsumed,
+            };
+            let core_rule = split_rule.to_canonicalized_core_rule(
+                &self.type_info,
+                &mut self.parser.symbol_gen,
+                union_to_set,
+            )?;
+            let rule_id = {
+                let mut rb = self.backend.new_rule(&name, seminaive);
+                rb.set_no_decomp(no_decomp);
+                let mut translator =
+                    BackendRule::new(rb, &self.functions, &self.type_info, requires_read_context);
+                translator.query(&core_rule.body, split_rule.include_subsumed);
+                translator.actions(&core_rule.head)?;
+                translator.build()
+            };
+            compiled.push((name, core_rule, rule_id));
+        }
+        Ok(compiled)
     }
 
     fn eval_actions(&mut self, actions: &ResolvedActions) -> Result<(), Error> {
@@ -2948,6 +3042,35 @@ impl<'a> BackendRule<'a> {
     fn build(self) -> egglog_bridge::RuleId {
         self.rb.build()
     }
+}
+
+/// Whether every non-global variable referenced by `branch` is bound by one of
+/// the branch's own table (function/relation) atoms. A self-groundable branch
+/// can be evaluated by C's fused union node, which requires each branch to bind
+/// the union's output variables itself. A branch that references a variable it
+/// does not bind — a *correlated* branch, e.g. `(= col d)` where `col` and `d`
+/// come from the surrounding conjunction — is not self-groundable and is
+/// compiled by splitting instead.
+fn branch_self_groundable(branch: &[ast::ResolvedFact]) -> bool {
+    let mut bound: IndexSet<String> = IndexSet::default();
+    for fact in branch {
+        if let ast::ResolvedFact::Fact(ResolvedExpr::Call(_, ResolvedCall::Func(_), _)) = fact {
+            fact.visit_vars(&mut |_, v| {
+                if !v.is_global_ref {
+                    bound.insert(v.name.clone());
+                }
+            });
+        }
+    }
+    let mut groundable = true;
+    for fact in branch {
+        fact.visit_vars(&mut |_, v| {
+            if !v.is_global_ref && !bound.contains(&v.name) {
+                groundable = false;
+            }
+        });
+    }
+    groundable
 }
 
 /// Expands one `or` branch (a conjunction of facts that may itself contain

@@ -12,26 +12,33 @@ A rule body may contain a disjunction fact:
       (action ...))
 ```
 
-Each branch is a parenthesized *list of facts* (a conjunction). The body
-`C ∧ (D₁ ∨ … ∨ Dₙ)` matches when the surrounding conjunction `C` holds and at
-least one branch `Dᵢ` holds.
+Each branch is either a parenthesized *list of facts* (a conjunction,
+`((A x) (B x))`) or a single bare fact (`(= a d)`, `(A x)`). Both the lowercase
+`or` and uppercase `OR` spellings are accepted. The body `C ∧ (D₁ ∨ … ∨ Dₙ)`
+matches when the surrounding conjunction `C` holds and at least one branch `Dᵢ`
+holds.
 
 ## Semantics
 
 - **Common variables.** `V = ⋂ᵢ vars(Dᵢ)` — the variables that appear in every
   branch. Only `V`, together with the variables bound by the surrounding
   conjunction `C`, are visible in the action and elsewhere outside the `or`.
-- **Branch-local variables.** A variable that appears in some branch but is not
-  in `V` is *branch-local*. Branch-locals in different branches are independent:
-  during typechecking they are renamed to fresh names so their sorts are not
-  conflated. A branch-local variable that is used outside its `or` is a type
-  error (`TypeError::OrBranchLocalEscapes`).
+- **Correlated branches.** A branch may reference a variable bound by the
+  surrounding conjunction `C` (even one not common to every branch), e.g.
+  `(= col d)` where `col` and `d` come from `C`. Such a reference is left
+  untouched during typechecking; it is *not* treated as branch-local.
+- **Branch-local variables.** A variable that appears in some branch but is
+  neither in `V` nor bound by `C` is *branch-local*. Branch-locals in different
+  branches are independent: during typechecking they are renamed to fresh names
+  so their sorts are not conflated. A branch-local variable that is used outside
+  its `or` is a type error (`TypeError::OrBranchLocalEscapes`).
 - **Empty branch.** A branch with no facts is a type error
   (`TypeError::EmptyOrBranch`).
 - **Scope.** `or` is only supported inside rule bodies (including the `:when`
   conditions of a `rewrite`, which desugar to rules). It is rejected in
   query-shaped commands like `check` and `query`
-  (`TypeError::OrOutsideRule`).
+  (`TypeError::OrOutsideRule`). It is allowed under the term encoding without
+  proofs; with proofs it is unsupported.
 
 ## Frontend pipeline
 
@@ -40,13 +47,17 @@ least one branch `Dᵢ` holds.
    and `map_symbols` recurse into the branches
    (`egglog-ast/src/generic_ast_helpers.rs`).
 2. **Parsing** — `src/ast/parse.rs`: `parse_fact` recognises the `OR_HEAD`
-   (`"or"`) head and parses each argument as a list of facts.
+   (`"or"`) / `OR_HEAD_UPPER` (`"OR"`) head. Each argument is parsed as a list
+   of facts if it is an empty list or its first element is itself a list;
+   otherwise it is a single bare fact.
 3. **Typechecking** — `src/typechecking.rs` `typecheck_rule`:
    - `rename_or_locals` renames each branch's branch-local variables to fresh
      names (independently per branch) and enforces the interface rule
-     (branch-locals may not escape their `or`). `outside_vars` is the set of
-     variables visible outside every `or`: conjunctive-fact variables, action
-     variables, and each `or`'s common variables.
+     (branch-locals may not escape their `or`). It takes both `outside_vars`
+     (all variables visible outside every `or`: conjunctive-fact variables,
+     action variables, and each `or`'s common variables) and `conj_vars` (the
+     subset bound by the surrounding conjunction); a branch reference to a
+     `conj_var` is a correlation and is left as-is rather than renamed.
    - `Facts::to_query` (`src/ast/mod.rs`) flattens every branch's atoms into one
      shared constraint `Query` so the constraint solver assigns a sort to every
      variable — common variables (whose sort is thereby unified across branches
@@ -56,15 +67,26 @@ least one branch `Dᵢ` holds.
    - `src/ast/check_shadowing.rs` recurses into `or` branches when collecting
      pattern variable names.
 
-## Backend compilation: Strategy C — a fused union node in the free-join engine
+## Backend compilation
 
-An `or`-containing rule compiles to **one** backend rule with a fused union node
-in the free-join engine. The surrounding conjunction `C` is scanned **once**;
-the branches are enumerated additively (never a `∏` of separate rules).
+`add_rule` dispatches `or`-containing rules to `add_or_rule`, which picks one of
+two strategies (returning one `(name, core rule, backend rule id)` per compiled
+backend rule):
 
-### egglog crate (`src/lib.rs`, `add_or_rule`)
+- **Strategy C — fused union node.** Used when the rule is naive *and* every
+  disjunct is *self-groundable* (`branch_self_groundable`: every non-global
+  variable the disjunct references is bound by one of its own table atoms). One
+  backend rule with a fused union node; `C` is scanned once.
+- **Strategy D — splitting.** Used otherwise — a *correlated* disjunct (which
+  references a `C`-bound variable it does not bind itself) or a seminaive rule.
+  See "Strategy D" below.
 
-`add_rule` dispatches `or`-containing rules to `add_or_rule`, which:
+## Strategy C — a fused union node in the free-join engine
+
+The `or`-containing rule compiles to **one** backend rule with a fused union
+node in the free-join engine. The surrounding conjunction `C` is scanned
+**once**; the branches are enumerated additively (never a `∏` of separate
+rules). `add_or_rule` (Strategy-C path):
 
 1. Splits the body into the conjunction `C` (non-`or` facts) and the `or`s, and
    forms the union's **branches** as the cartesian product of every `or`'s
@@ -129,20 +151,77 @@ This shares `C`: it is evaluated a single time in the result block, joined by
 index against the deduplicated union of the branch outputs — never re-scanned per
 branch and never producing `∏` separate rules.
 
-### Tradeoffs / restrictions
+### Strategy-C tradeoffs / restrictions
 
-- **Naive evaluation.** `or` rules match the whole database each iteration
-  (seminaive delta through a union is not supported).
+- **Naive only.** Strategy C runs in naive mode; a seminaive rule uses Strategy
+  D instead.
 - **Primitives in branches** are rejected (a branch must be a conjunction of
   table atoms). Primitives in the surrounding conjunction `C` are fine.
 - **`∏` branches for multiple/nested `or`s.** `k` disjunctions produce `∏`
   union *branches* (enumerated additively into one materialization), but still a
-  single rule with `C` scanned once — unlike rule-splitting, which would create
-  `∏` rules each re-scanning `C`. A single `or` (the common case) is linear.
+  single rule with `C` scanned once. A single `or` (the common case) is linear.
 - **No cross-branch dedup of firings beyond the output key.** The union
   deduplicates output tuples; like every egglog rule, the action still fires per
   full match otherwise. This matches egglog's normal non-dedup semantics and is
   invisible for idempotent actions.
-- **Proofs.** `or` is not supported with the proof / term encoding; the proof
-  passes panic if they ever see an `or` fact (they never do, because proof mode
-  compiles only proof-instrumented rules).
+
+## Strategy D — splitting (correlated / seminaive `or`s)
+
+Strategy C's fused union requires each branch to bind the union's output
+variables *itself* (its branches run first, materializing those variables), and
+it forces naive mode. Neither holds for a **correlated** `or` such as the
+e-graph rebuild pattern
+
+```
+(rule ((MulView c0 c1 c2) (UF_Math d e) (!= d e)
+       (OR (= c0 d) (= c1 d) (= c2 d)))
+      (...)
+      :ruleset rebuilding :unsafe-seminaive)
+```
+
+where each disjunct only *constrains* variables (`c0`/`d`) bound by the
+surrounding conjunction, and where per-disjunct variable merging (`c0 = d` in
+one branch, `c1 = d` in another) must propagate into the shared action.
+
+`add_or_rule` (via `add_or_rule_split` in `src/lib.rs`) therefore compiles a
+correlated or seminaive `or` by **splitting**: the disjuncts are expanded into
+the cartesian product of the `or`s (`expand_or_branch`), and for each combined
+disjunct one ordinary backend rule is emitted, with body `C ∧ disjunct` and the
+rule's shared action. Extra split rules get synthetic names `{name}__or{i}` so
+they coexist in the ruleset (`add_rule` inserts one ruleset entry per split).
+
+Each split rule is a plain conjunctive rule, so the existing machinery does the
+right thing with no changes to the free-join engine or seminaive evaluation:
+
+- **Per-disjunct canonicalization** merges each disjunct's equalities
+  independently. `(= c0 d)` substitutes `c0 → d`, so `MulView(c0,c1,c2)` becomes
+  `MulView(d,c1,c2)` sharing variable `d` with `UF_Math(d,e)`. A join on a
+  shared variable is an **index probe**, never a cartesian product — even in
+  naive mode. The merge propagates into the action, so a correlated variable
+  resolves correctly there too.
+- **Seminaive** (`:unsafe-seminaive`) runs normally per split rule. A delta on
+  the outer atom (`UF_Math`) drives an index probe of the correlated atom
+  (`MulView`) by the new key; a delta on `MulView` probes `UF_Math`. The
+  `Read`/`Full` RHS contexts of `:unsafe-seminaive` let the action perform
+  lookups (e.g. `(UF_Mathf c0)`).
+- **Primitives** in the surrounding conjunction (e.g. `(!= d e)`) are ordinary
+  RHS-context checks in each split rule.
+
+### Strategy-D tradeoffs / restrictions
+
+- **`k` backend rules per `or`.** A `k`-way `or` (or `∏` over several `or`s)
+  becomes `k` (or `∏`) backend rules. In seminaive mode this is cheap — each
+  processes only the delta and probes by index — so the cartesian-product
+  blow-up the fused union avoids does not reappear.
+- **Split rule names.** Extra disjuncts occupy synthetic `{name}__or{i}`
+  ruleset entries, which show up separately in run reports.
+
+## Proofs and the term encoding
+
+`or` is allowed under the term encoding **without** proofs: `proof_form`
+normalizes each branch independently, and `instrument_fact` rewrites each
+branch's atoms to view-table lookups and re-emits an `(or (branch...) ...)`
+fact, which is then compiled by the strategies above. With proofs enabled the
+instrumentation panics (`or` is unsupported with proofs). `:unsafe-seminaive`
+remains unsupported under the term encoding regardless (a pre-existing
+limitation, since it performs arbitrary live-database reads).
