@@ -332,3 +332,43 @@ fn or_correlated_rebuild_to_fixpoint() -> Result<(), Error> {
 (fail (check (v 1 1 3)))
 ")
 }
+
+/// The correlated union is **delta-driven**, not a per-iteration re-scan. A
+/// global counter `nfire` sums the firings via `(+)`. Under seminaive delta each
+/// match fires exactly once; under naive re-evaluation the fixpoint would re-fire
+/// the matching row every iteration, so the fixpoint counter (`= 1`) alone rules
+/// out naive. Then adding ONE new `stale` edge and running one step fires only
+/// for the rows that edge newly makes stale (2 of them) — `nfire` goes 1 -> 3,
+/// independent of the table size — demonstrating an index probe by the new edge,
+/// not an O(N) re-scan that would also re-fire the already-stale row.
+#[test]
+fn or_correlated_seminaive_delta_driven() -> Result<(), Error> {
+    run("
+(relation v (i64 i64 i64))
+(relation stale (i64 i64))
+(function nfire () i64 :merge (+ old new))
+(set (nfire) 0)
+
+(v 1 20 30)
+(v 40 50 60)
+(v 70 80 90)
+(v 7 11 12)
+(v 13 7 14)
+(v 15 16 17)
+
+(stale 1 100)   ; initially only (v 1 20 30) is stale (column a = 1)
+
+(ruleset rr)
+(rule ((v a b c)
+       (OR ((stale a al)) ((stale b bl)) ((stale c cl))))
+      ((set (nfire) 1))
+      :ruleset rr :unsafe-seminaive)
+
+(run rr 100)
+(check (= (nfire) 1))   ; fired once for the one stale row (delta, not per-iteration)
+
+(stale 7 700)           ; newly makes (v 7 11 12) and (v 13 7 14) stale
+(run rr 1)
+(check (= (nfire) 3))   ; +2 only for the newly-affected rows; the old row is not re-fired
+")
+}

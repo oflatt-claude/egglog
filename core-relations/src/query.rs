@@ -16,7 +16,7 @@ use crate::{
     free_join::{
         ActionId, AtomId, Database, ProcessedConstraints, SubAtom, TableId, TableInfo, VarInfo,
         Variable,
-        plan::{JoinHeader, JoinStages, Plan, PlanStrategy},
+        plan::{JoinHeader, JoinStage, JoinStages, Plan, PlanStrategy, UnionBranch},
     },
     pool::{Pooled, with_pool_set},
     table_spec::{ColumnId, Constraint},
@@ -274,6 +274,110 @@ impl<'outer> RuleSetBuilder<'outer> {
         )
     }
 
+    /// Reprocesses a union branch's header constraints against the current
+    /// database and adds `extra` timestamp constraints (per-atom), returning a
+    /// fresh [`UnionBranch`] over the same atoms and stages. Returns `None` if
+    /// any atom's constraints select zero rows (the branch is empty this epoch).
+    fn reprocess_union_branch(
+        &self,
+        branch: &UnionBranch,
+        extra: &[(AtomId, Constraint)],
+    ) -> Option<UnionBranch> {
+        let mut header = Vec::new();
+        for (atom_id, atom_info) in branch.atoms.iter() {
+            let mut constraints: Vec<Constraint> = branch
+                .header
+                .iter()
+                .filter(|h| h.atom == atom_id)
+                .flat_map(|h| h.constraints.iter().cloned())
+                .collect();
+            for (a, c) in extra {
+                if *a == atom_id {
+                    constraints.push(c.clone());
+                }
+            }
+            if constraints.is_empty() {
+                continue;
+            }
+            header.push(self.reprocess_constraints(atom_info.table, atom_id, &constraints)?);
+        }
+        Some(UnionBranch {
+            atoms: branch.atoms.clone(),
+            header,
+            stages: branch.stages.clone(),
+        })
+    }
+
+    /// Add a seminaive variant of a fused-union rule from a cached plan.
+    ///
+    /// Semi-naive of a union of conjunctions is the union of the per-disjunct
+    /// seminaive expansions: `seminaive(⋁ᵢ Bᵢ) = ⋃ᵢ seminaive(Bᵢ)`. Each entry
+    /// of `variants` is `(branch_index, per-atom timestamp constraints)` for one
+    /// such expansion term; it becomes one *variant branch* (the cached branch
+    /// `branch_index` narrowed by those constraints via its header). All variant
+    /// branches are collected into the single [`JoinStage::Union`] so they feed
+    /// the one deduplicating materialization and the shared action — so a row
+    /// matched via several branches is still processed once.
+    ///
+    /// Requires a cached union plan whose sole block-0 stage is a `Union` (as
+    /// produced by `plan_union`). Returns `None` if no variant branch is live.
+    pub fn add_union_rule_from_cached(
+        &mut self,
+        cached: &CachedPlan,
+        variants: &[(usize, Vec<(AtomId, Constraint)>)],
+    ) -> Option<RuleId> {
+        let Plan::DecomposedPlan(dp) = &cached.plan else {
+            panic!("add_union_rule_from_cached: cached plan is not a decomposed union plan");
+        };
+        let block0 = &dp.stages.blocks[0];
+        let JoinStage::Union { branches } = &block0.0.instrs[0] else {
+            panic!("add_union_rule_from_cached: block 0 is not a Union stage");
+        };
+
+        let mut new_branches = Vec::with_capacity(variants.len());
+        for (branch_index, extra) in variants {
+            if let Some(vb) = self.reprocess_union_branch(&branches[*branch_index], extra) {
+                new_branches.push(vb);
+            }
+        }
+        if new_branches.is_empty() {
+            return None;
+        }
+
+        // Reprocess the (possibly empty) continuation header against the current
+        // database, mirroring `get_rule_with_extra_constraints`.
+        let mut header = vec![];
+        self.reprocess_existing_headers(&mut header, &dp.atoms, &dp.header)?;
+
+        let action_id = self.rule_set.actions.next_id();
+        let new_block0 = (
+            JoinStages {
+                instrs: Arc::new(vec![JoinStage::Union {
+                    branches: new_branches,
+                }]),
+            },
+            block0.1.clone(),
+        );
+        let plan = Plan::DecomposedPlan(DecomposedPlan {
+            atoms: dp.atoms.clone(),
+            header,
+            stages: JoinStageBlocks {
+                blocks: vec![new_block0],
+            },
+            result_block: JoinStages {
+                instrs: dp.result_block.instrs.clone(),
+            },
+            actions: action_id,
+        });
+        let actual_action_id = self.rule_set.actions.push(cached.actions.clone());
+        debug_assert_eq!(action_id, actual_action_id);
+        Some(
+            self.rule_set
+                .plans
+                .push((plan, cached.desc.clone(), cached.symbol_map.clone())),
+        )
+    }
+
     /// Build the ruleset.
     pub fn build(self) -> RuleSet {
         self.rule_set
@@ -315,8 +419,9 @@ impl<'outer, 'a> QueryBuilder<'outer, 'a> {
     /// (the variables common to every branch).
     ///
     /// A union query is always planned as a single bag (tree-decomposition is
-    /// skipped), and is intended to be run in naive mode (seminaive delta
-    /// through a union is not supported).
+    /// skipped). Seminaive evaluation is delivered by
+    /// [`RuleSetBuilder::add_union_rule_from_cached`], which delta-drives each
+    /// branch (the union of the per-disjunct seminaive expansions).
     pub fn set_union(&mut self, branch_atoms: Vec<Vec<AtomId>>, output_vars: Vec<Variable>) {
         self.query.no_decomp = true;
         self.query.union = Some(UnionSpec {

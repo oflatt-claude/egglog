@@ -1268,10 +1268,7 @@ impl EGraph {
         // A disjunct is *correlated* if it references a variable bound by the
         // surrounding conjunction that is not common to every disjunct (e.g.
         // `(UF_Math a al)` where `a` comes from the outer row). Such a branch
-        // cannot bind the shared output row on its own, so the surrounding
-        // conjunction is prepended into every branch; the branches then bind the
-        // row and probe their own atoms by the correlated columns. Independent
-        // `or`s keep the conjunction as a scanned-once continuation.
+        // cannot bind the shared output row on its own.
         let conj_vars = {
             let mut m = IndexMap::default();
             collect_resolved_fact_vars(&conj_facts, &mut m);
@@ -1287,9 +1284,19 @@ impl EGraph {
                 .any(|name| conj_vars.contains_key(name) && !disjunct_common_names.contains(name))
         });
 
-        // Branch fact lists and continuation depend on the layout.
+        // The surrounding conjunction is **prepended** into every branch of a
+        // correlated `or`, so each branch binds the shared output row itself and
+        // probes its own atoms by the correlated columns. This also puts all of a
+        // branch's `O ∪ Bᵢ` atoms in one branch, which the per-branch seminaive
+        // delta expansion requires (see `add_union_rule_from_cached`). An
+        // independent `or` keeps the conjunction as a scanned-once continuation
+        // and runs naive.
+        let prepend = correlated;
+        // Seminaive (delta-driven) union execution is used for correlated rules
+        // (all atoms in branches); independent unions run naive.
+        let union_seminaive = seminaive && correlated;
         let (branch_fact_lists, continuation_facts): (Vec<Vec<ast::ResolvedFact>>, Vec<_>) =
-            if correlated {
+            if prepend {
                 let branches = disjuncts
                     .iter()
                     .map(|d| {
@@ -1360,13 +1367,12 @@ impl EGraph {
         }
 
         let rule_id = {
-            // Run in naive mode: the seminaive delta machinery constrains atoms
-            // by their position in `plan.atoms`, but a union's branch atoms live
-            // in per-branch sub-plans, so a delta focus can't reach them. The
-            // `:unsafe-seminaive` Read/Full RHS context (for action lookups) is
-            // still honored via `requires_read_context`.
-            let _ = seminaive;
-            let mut rb = self.backend.new_rule(&rule.name, false);
+            // Seminaive union rules delta-drive each branch: the bridge's
+            // `add_rules_from_cached` generates per-branch focus/old timestamp
+            // variants (`⋃ᵢ seminaive(Bᵢ)`), all feeding the one deduplicating
+            // materialization. This requires every atom of a branch to live in
+            // that branch, which `prepend` (correlated) guarantees.
+            let mut rb = self.backend.new_rule(&rule.name, union_seminaive);
             rb.set_no_decomp(no_decomp);
             let mut translator =
                 BackendRule::new(rb, &self.functions, &self.type_info, requires_read_context);

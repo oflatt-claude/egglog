@@ -211,9 +211,10 @@ impl RuleBuilder<'_> {
     /// (the variables common to every branch). See
     /// [`core_relations::QueryBuilder::set_union`].
     ///
-    /// A union rule is run in naive mode (seminaive delta through a union is not
-    /// supported), so callers should construct it via
-    /// `new_rule(desc, /* seminaive */ false)`.
+    /// A union rule may be seminaive: when built with `new_rule(desc, true)`,
+    /// [`Query::add_rules_from_cached`] delta-drives each branch (the union of
+    /// the per-disjunct seminaive expansions). This is intended for rules whose
+    /// branches each carry all their conjuncts (no continuation atoms).
     pub fn set_union_branches(
         &mut self,
         branch_atoms: Vec<Vec<AtomId>>,
@@ -838,6 +839,47 @@ impl Query {
         // directly.
         if !self.seminaive || (self.atoms.is_empty() && mid_ts == Timestamp::new(0)) {
             let _ = rsb.add_rule_from_cached_plan(&cached_plan.plan, &[]);
+            return;
+        }
+        if let Some((branch_atoms, _)) = &self.union {
+            // A fused union is `⋁ᵢ Bᵢ`; its semi-naive expansion is the union of
+            // the per-disjunct expansions. For each branch we generate the
+            // standard per-atom focus/old variants over that branch's atoms only
+            // (never across branch boundaries — other branches are alternatives,
+            // not conjuncts). Every variant becomes one branch of the single
+            // deduplicating union, so a new tuple in a branch atom drives that
+            // branch's probe while dedup keeps the shared action firing once.
+            let mut variants: Vec<(usize, Vec<(core_relations::AtomId, Constraint)>)> = Vec::new();
+            for (branch_index, atoms) in branch_atoms.iter().enumerate() {
+                'focus: for focus in 0..atoms.len() {
+                    let mut constraints = Vec::with_capacity(focus + 1);
+                    let focus_idx = atoms[focus].index();
+                    let ts_col = ColumnId::from_usize(self.atoms[focus_idx].2.ts_col());
+                    constraints.push((
+                        cached_plan.atom_mapping[focus_idx],
+                        Constraint::GeConst {
+                            col: ts_col,
+                            val: mid_ts.to_value(),
+                        },
+                    ));
+                    for old in &atoms[0..focus] {
+                        if mid_ts == Timestamp::new(0) {
+                            continue 'focus;
+                        }
+                        let old_idx = old.index();
+                        let ts_col = ColumnId::from_usize(self.atoms[old_idx].2.ts_col());
+                        constraints.push((
+                            cached_plan.atom_mapping[old_idx],
+                            Constraint::LtConst {
+                                col: ts_col,
+                                val: mid_ts.to_value(),
+                            },
+                        ));
+                    }
+                    variants.push((branch_index, constraints));
+                }
+            }
+            let _ = rsb.add_union_rule_from_cached(&cached_plan.plan, &variants);
             return;
         }
         if let Some(focus_atom) = self.sole_focus {

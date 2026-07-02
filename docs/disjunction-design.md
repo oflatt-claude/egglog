@@ -105,9 +105,10 @@ disjunctive-semijoin single-rebuild semantics.
    a correlated branch variable is grounded by the prepended `C`).
 6. Builds one backend rule: adds the continuation's atoms (`BackendRule::query`),
    then each branch's atoms (`query_union_branch`, recording their `AtomId`s),
-   calls `set_union_branches`, and adds the actions. The rule runs in **naive**
-   mode (see restrictions). Branch atoms must be table atoms; a primitive inside
-   a branch is rejected — a `!=` staleness filter is encoded as a relation (e.g.
+   calls `set_union_branches`, and adds the actions. A correlated rule runs
+   **seminaive / delta-driven** (see "Seminaive execution"); an independent one
+   runs naive. Branch atoms must be table atoms; a primitive inside a branch is
+   rejected — a `!=` staleness filter is encoded as a relation (e.g.
    `(stale term leader)` holding only non-canonical terms).
 
 ### Bridge (`egglog-bridge/src/rule.rs`)
@@ -174,15 +175,43 @@ matches two branches but produces the same `(a b c)` tuple, so the shared action
 rebuilds it **exactly once**. `:unsafe-seminaive` supplies the `Read`/`Full` RHS
 context the action needs for the `leader` lookups.
 
+### Seminaive (delta-driven) execution
+
+A correlated union runs **seminaive**: a new `stale`/`AddView` tuple drives an
+index probe of the other branch atom, rather than a per-iteration re-scan.
+
+The semi-naive expansion of a union of conjunctions is the union of the
+per-disjunct expansions: `seminaive(⋁ᵢ Bᵢ) = ⋃ᵢ seminaive(Bᵢ)`. Because a
+correlated `or` prepends the conjunction into every branch, each branch `Bᵢ`
+holds all of `O ∪ (branch i's atoms)`, so its semi-naive expansion is
+self-contained (delta constraints never cross branch boundaries — other branches
+are alternatives, not conjuncts).
+
+- **`egglog-bridge` `add_rules_from_cached`**: for a union rule it iterates each
+  branch and, per focus atom, builds the standard focus/old timestamp
+  constraints (`GeConst` on the focus atom's `ts_col`, `LtConst` on the atoms
+  before it) over that branch's atoms only. Each `(branch_index, constraints)` is
+  one *variant*. It calls `RuleSetBuilder::add_union_rule_from_cached`.
+- **`core-relations` `add_union_rule_from_cached`**: builds a single variant of
+  the cached union plan whose `JoinStage::Union` holds one *variant branch* per
+  variant — the cached branch narrowed by that variant's timestamp constraints
+  applied as extra `JoinHeader`s (`reprocess_union_branch`). All variant branches
+  feed the one deduplicating block-0 materialization and the shared action, so a
+  row reached via several branches (or several focus atoms) is still processed
+  once. This is how the branch delta constraint reaches the branch sub-plan: it
+  becomes a header on that branch, which `execute.rs`'s `JoinStage::Union`
+  handler already intersects into the branch's atom subsets before running it.
+
+Independent `or`s (no correlation) keep the scanned-once continuation and run
+naive.
+
 ### Restrictions
 
-- **Naive evaluation.** The rule runs naive: the seminaive delta machinery
-  constrains atoms by their position in the top-level plan's atom list, but a
-  union's branch atoms live in per-branch sub-plans a delta focus can't reach.
-  This is correct at a fixpoint (a rebuild rule that deletes the stale row
-  converges), but not incremental. Making the delta drive an index probe of a
-  branch atom (the true seminaive rebuild) needs the delta machinery extended to
-  reach `JoinStage::Union` branches — future work.
+- **Independent `or`s run naive** (re-matched each iteration). Only correlated
+  `or`s are delta-driven. (Seminaive of an independent `or` whose conjunction is
+  a continuation would need the delta split between the continuation and the
+  branches; prepending the conjunction into the branches, as the correlated path
+  does, is the route to make it delta-driven.)
 - **Primitives in branches** are rejected (a branch must be a conjunction of
   table atoms). Primitives in the surrounding conjunction are fine; a `!=`
   staleness filter is encoded as a staleness relation instead.
