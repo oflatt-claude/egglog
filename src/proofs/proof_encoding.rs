@@ -8,6 +8,9 @@ use crate::*;
 pub(crate) struct EncodingState {
     pub uf_parent: HashMap<String, String>,
     pub uf_function: HashMap<String, String>,
+    /// Sort name -> per-sort staleness relation name, used by the correlated-`OR`
+    /// rebuild rule. Declared once per sort.
+    pub stale_relations: HashMap<String, String>,
     /// Maps sort name -> proof function name (set from :internal-proof-func annotation).
     pub proof_func_parent: HashMap<String, String>,
     /// Function name -> (hidden current-value function, input arity). The
@@ -34,6 +37,7 @@ impl EncodingState {
         Self {
             uf_parent: HashMap::default(),
             uf_function: HashMap::default(),
+            stale_relations: HashMap::default(),
             proof_func_parent: HashMap::default(),
             merge_current: HashMap::default(),
             term_header_added: false,
@@ -522,6 +526,10 @@ impl<'a> ProofInstrumentor<'a> {
     }
 
     /// Rules that update the views when children change.
+    ///
+    /// The term encoding rebuilds via a correlated `OR` (delta-driven, with
+    /// per-row dedup); proofs keep the existing guarded-`OR` rule since the `OR`
+    /// disjunction is unsupported under proofs.
     fn rebuilding_rules(&mut self, fdecl: &ResolvedFunctionDecl) -> Vec<Command> {
         let types = fdecl.resolved_schema.view_types();
 
@@ -530,6 +538,128 @@ impl<'a> ProofInstrumentor<'a> {
             return vec![];
         }
 
+        if self.egraph.proof_state.proofs_enabled {
+            self.rebuilding_rules_current(fdecl, &types)
+        } else {
+            self.rebuilding_rules_correlated(fdecl, &types)
+        }
+    }
+
+    /// Rewrites a view row to its canonical form by re-looking-up each eq-sort
+    /// column's current leader in the UF index, then deletes the stale row.
+    /// Leaders are read in the action, so callers mark the rule `:unsafe-seminaive`.
+    fn rebuild_action(
+        &mut self,
+        fdecl: &ResolvedFunctionDecl,
+        types: &[ArcSort],
+        children: &str,
+    ) -> String {
+        let view_name = self.view_name(&fdecl.name);
+        let child = |i: usize| format!("c{i}_");
+        let mut lets = String::new();
+        let mut view_args: Vec<String> = Vec::with_capacity(types.len());
+        for (i, ty) in types.iter().enumerate() {
+            if ty.is_eq_sort() {
+                let uf = self.uf_function_name(ty.name());
+                let u = format!("u{i}_");
+                lets.push_str(&format!("(let {u} ({uf} {}))\n", child(i)));
+                view_args.push(u);
+            } else {
+                view_args.push(child(i));
+            }
+        }
+        let updated_view = self.update_view(&fdecl.name, &view_args, "()");
+        format!("{lets}{updated_view}\n(delete ({view_name} {children}))")
+    }
+
+    /// Term-encoding rebuild rule: fires when any eq-sort column of a view row
+    /// becomes non-canonical, then re-canonicalizes the whole row.
+    ///
+    /// With a single eq-sort column the rule is delta-driven directly off a new
+    /// UF parent edge on that column. With several, it uses a correlated `OR`
+    /// over per-sort staleness relations so a row stale in multiple columns
+    /// still rebuilds exactly once. Staleness is a monotone superset of
+    /// non-canonical terms; the action re-looks-up the current leader, so a
+    /// stale superset is safe.
+    fn rebuilding_rules_correlated(
+        &mut self,
+        fdecl: &ResolvedFunctionDecl,
+        types: &[ArcSort],
+    ) -> Vec<Command> {
+        let rebuilding_ruleset = self.proof_names().rebuilding_ruleset_name.clone();
+        let view_name = self.view_name(&fdecl.name);
+        let child = |i: usize| format!("c{i}_");
+        let children_vec: Vec<String> = (0..types.len()).map(child).collect();
+        let children = format!("{}", ListDisplay(&children_vec, " "));
+        let eq_cols: Vec<usize> = types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.is_eq_sort())
+            .map(|(i, _)| i)
+            .collect();
+
+        let action = self.rebuild_action(fdecl, types, &children);
+        let fresh_name = self.egraph.parser.symbol_gen.fresh("rebuild_rule");
+        let mut program = String::new();
+
+        if eq_cols.len() == 1 {
+            // A single eq-sort column makes the `OR` degenerate; emit the plain
+            // delta-driven rule instead, triggered by a new UF parent edge.
+            let i = eq_cols[0];
+            let pname = self.uf_name(types[i].name());
+            let ci = child(i);
+            program.push_str(&format!(
+                "(rule (({view_name} {children})
+                        ({pname} {ci} e_)
+                        (!= {ci} e_))
+                     (
+                      {action}
+                     )
+                      :ruleset {rebuilding_ruleset} :unsafe-seminaive :name \"{fresh_name}\" :internal-include-subsumed)"
+            ));
+        } else {
+            // Declare each sort's staleness relation and its maintenance rule once.
+            for &i in &eq_cols {
+                let (stale, is_new) = self.stale_relation_name(types[i].name());
+                if is_new {
+                    let pname = self.uf_name(types[i].name());
+                    let sort = types[i].name();
+                    let maint = self.egraph.parser.symbol_gen.fresh("stale_maint");
+                    // Hidden Unit table so it stays out of `print-size`.
+                    program.push_str(&format!(
+                        "(function {stale} ({sort} {sort}) Unit :merge old :internal-hidden)
+                         (rule (({pname} t_ l_) (!= t_ l_)) ((set ({stale} t_ l_) ())) :ruleset {rebuilding_ruleset} :name \"{maint}\")\n"
+                    ));
+                }
+            }
+            let branches: Vec<String> = eq_cols
+                .iter()
+                .map(|&i| {
+                    let (stale, _) = self.stale_relation_name(types[i].name());
+                    format!("(({stale} {} l{i}_))", child(i))
+                })
+                .collect();
+            let or_expr = format!("(OR {})", branches.join(" "));
+            program.push_str(&format!(
+                "(rule (({view_name} {children})
+                        {or_expr})
+                     (
+                      {action}
+                     )
+                      :ruleset {rebuilding_ruleset} :unsafe-seminaive :name \"{fresh_name}\" :internal-include-subsumed)"
+            ));
+        }
+        self.parse_program(&program)
+    }
+
+    /// Existing single-rule-per-constructor rebuild, used under proofs. One rule
+    /// per constructor with a `(guard (or (bool-!= ...)))` filter over UF-index
+    /// leader lookups bound in the query.
+    fn rebuilding_rules_current(
+        &mut self,
+        fdecl: &ResolvedFunctionDecl,
+        types: &[ArcSort],
+    ) -> Vec<Command> {
         let view_name = self.view_name(&fdecl.name);
         let child = |i: usize| format!("c{i}_");
         let children_vec: Vec<String> = (0..types.len()).map(child).collect();

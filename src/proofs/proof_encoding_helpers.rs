@@ -114,6 +114,26 @@ impl ProofInstrumentor<'_> {
         }
     }
 
+    /// Returns the per-sort staleness relation name for the correlated-`OR`
+    /// rebuild rule, along with whether it was just allocated (so the caller
+    /// declares the relation and its maintenance rule exactly once).
+    pub(crate) fn stale_relation_name(&mut self, sort: &str) -> (String, bool) {
+        if let Some(name) = self.egraph.proof_state.stale_relations.get(sort) {
+            (name.clone(), false)
+        } else {
+            let fresh_name = self
+                .egraph
+                .parser
+                .symbol_gen
+                .fresh(&format!("stale_{sort}"));
+            self.egraph
+                .proof_state
+                .stale_relations
+                .insert(sort.to_string(), fresh_name.clone());
+            (fresh_name, true)
+        }
+    }
+
     /// Returns the name of the Pair sort used to bundle (leader, proof) in the UF function index.
     /// Only used in proof mode.
     pub(crate) fn uf_pair_sort_name(&mut self, sort: &str) -> String {

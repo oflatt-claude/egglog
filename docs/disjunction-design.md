@@ -157,8 +157,10 @@ tuples and fires the action once each.
 
 ### The correlated rebuild pattern
 
-The motivating example is e-graph rebuild. With a view `AddView(a,b,c)` and a
-staleness relation `stale(term, leader)` (holding only non-canonical terms):
+This is what the term encoding emits as the per-constructor rebuild rule (see
+[Proofs and the term encoding](#proofs-and-the-term-encoding)). With a view
+`AddView(a,b,c)` and a staleness relation `stale(term, leader)` (holding only
+non-canonical terms):
 
 ```
 (rule ((AddView a b c)
@@ -236,3 +238,32 @@ fact, which is then compiled by the strategies above. With proofs enabled the
 instrumentation panics (`or` is unsupported with proofs). `:unsafe-seminaive`
 remains unsupported under the term encoding regardless (a pre-existing
 limitation, since it performs arbitrary live-database reads).
+
+### Per-constructor rebuild rule
+
+Without proofs, the term encoding rebuilds each constructor's view with the
+[correlated rebuild pattern](#the-correlated-rebuild-pattern) above
+(`rebuilding_rules_correlated` in `src/proofs/proof_encoding.rs`). Each eq-sort
+column `S` gets one hidden per-sort staleness relation and a monotone
+maintenance rule that mirrors non-canonical UF parent edges into it:
+
+```
+(function stale_S (S S) Unit :merge old :internal-hidden)
+(rule ((UF_S t l) (!= t l)) ((set (stale_S t l) ())) :ruleset rebuilding)
+```
+
+The rebuild rule then correlates the view against those staleness relations
+(one `OR` branch per eq-sort column), re-looks-up each column's current leader
+in the UF index in the action, and deletes the stale row. A view with a single
+eq-sort column degenerates to the plain delta-driven rule
+`((View ..) (UF_S ci e) (!= ci e))` (no one-branch `OR`); with none, no rebuild
+rule is emitted. Non-eq-sort columns (including container sorts, which are not
+`is_eq_sort`) are left untouched, as before.
+
+Staleness is a monotone superset of non-canonical terms — a term never becomes
+canonical again — and the action re-derives the current leader, so an outdated
+`stale_S` row is harmless. The rule is marked `:unsafe-seminaive` for the action
+reads; the maintenance rule is ordinary Datalog. Because rebuild runs to a
+fixpoint, this produces the same final e-graph as the proof-mode rule, which
+keeps the earlier `(guard (or (bool-!= ...)))` formulation since `OR` is
+unsupported under proofs.
