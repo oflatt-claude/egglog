@@ -18,7 +18,7 @@ use crate::{constraint::grounded_check, *};
 use egglog_ast::generic_ast::{Change, GenericAction, GenericActions, GenericExpr};
 use egglog_ast::span::Span;
 use egglog_ast::util::ListDisplay;
-use typechecking::{FuncType, PrimitiveValidator, PrimitiveWithId, TypeError};
+use typechecking::{FuncType, PrimitiveDefinition, PrimitiveValidator, TypeError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HeadOrEq<Head> {
@@ -42,7 +42,8 @@ impl<Head> HeadOrEq<Head> {
 
 #[derive(Debug, Clone)]
 pub struct SpecializedPrimitive {
-    prim_with_id: PrimitiveWithId,
+    prim_with_id: PrimitiveDefinition,
+    runtime: Option<typechecking::PrimitiveRuntime>,
     input: Vec<ArcSort>,
     output: ArcSort,
 }
@@ -65,12 +66,27 @@ impl SpecializedPrimitive {
 
     /// Get the external function ID of this primitive
     pub(crate) fn external_id(&self, ctx: crate::Context) -> ExternalFunctionId {
-        self.prim_with_id.context_ids[ctx].unwrap_or_else(|| {
-            panic!(
-                "primitive {:?} is not valid in context {ctx:?}",
-                self.prim_with_id.primitive.name()
-            )
-        })
+        self.runtime
+            .as_ref()
+            .expect("primitive has not been installed in an EGraph")[ctx]
+            .unwrap_or_else(|| {
+                panic!(
+                    "primitive {:?} is not valid in context {ctx:?}",
+                    self.prim_with_id.primitive.name()
+                )
+            })
+    }
+
+    pub(crate) fn bind_runtime(&mut self, runtimes: &typechecking::PrimitiveRuntimes) {
+        self.runtime = runtimes.get(&self.prim_with_id.id).cloned();
+    }
+
+    pub(crate) fn runtime_id(
+        &self,
+        runtimes: &typechecking::PrimitiveRuntimes,
+        ctx: crate::Context,
+    ) -> ExternalFunctionId {
+        runtimes[&self.prim_with_id.id][ctx].expect("primitive is invalid in this context")
     }
 
     /// Get the validator function of this primitive, if any
@@ -82,12 +98,12 @@ impl SpecializedPrimitive {
 impl PartialEq for SpecializedPrimitive {
     fn eq(&self, other: &Self) -> bool {
         // This is the key used when resolved atoms are deduplicated by
-        // `(head, inputs)`. The context-id map identifies the primitive
+        // `(head, inputs)`. The logical definition identifies the primitive
         // registration, while the concrete input/output sorts identify the
         // specialization of generic primitives. The primitive name and
         // validator are registration metadata, so they are intentionally not
         // separate key fields.
-        self.prim_with_id.context_ids == other.prim_with_id.context_ids
+        self.prim_with_id.id == other.prim_with_id.id
             && self.output.name() == other.output.name()
             && self.input.len() == other.input.len()
             && self
@@ -102,7 +118,7 @@ impl Eq for SpecializedPrimitive {}
 
 impl Hash for SpecializedPrimitive {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.prim_with_id.context_ids.hash(state);
+        self.prim_with_id.id.hash(state);
         self.output.name().hash(state);
         self.input.len().hash(state);
         for input in &self.input {
@@ -170,7 +186,7 @@ impl ResolvedCall {
             .get_prims(head)
             .into_iter()
             .flatten()
-            .filter(|p| p.context_ids[ctx].is_some() && p.accept(types, typeinfo));
+            .filter(|p| p.is_valid_in_context(ctx) && p.accept(types, typeinfo));
         if let Some(picked) = primitives.next() {
             // Type inference has already assigned concrete types, so a valid
             // overload (`+`, `map-empty`, container primitives) leaves exactly
@@ -186,6 +202,7 @@ impl ResolvedCall {
             let (out, inp) = types.split_last().unwrap();
             return Ok(ResolvedCall::Primitive(SpecializedPrimitive {
                 prim_with_id: picked.clone(),
+                runtime: None,
                 input: inp.to_vec(),
                 output: out.clone(),
             }));
@@ -1144,6 +1161,7 @@ impl ResolvedRuleExt for ResolvedRule {
         let value_eq = |at1: &ResolvedAtomTerm, at2: &ResolvedAtomTerm| {
             ResolvedCall::Primitive(SpecializedPrimitive {
                 prim_with_id: value_eq.clone(),
+                runtime: None,
                 input: vec![at1.output(), at2.output()],
                 output: UnitSort.to_arcsort(),
             })

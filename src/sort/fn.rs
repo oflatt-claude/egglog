@@ -216,7 +216,7 @@ impl Sort for FunctionSort {
         val.1.clone()
     }
 
-    fn register_primitives(self: Arc<Self>, eg: &mut EGraph) {
+    fn register_primitives(self: Arc<Self>, eg: &mut TypeInfo) {
         eg.add_pure_primitive(
             Ctor {
                 name: "unstable-fn".into(),

@@ -11,7 +11,7 @@ impl BaseSort for StringSort {
     }
 
     #[rustfmt::skip]
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         let string_concat_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let mut concatenated = String::new();
             for &arg in args {

@@ -134,7 +134,7 @@ impl ContainerSort for VecSort {
             .collect()
     }
 
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         let arc: Arc<dyn Sort> = self.clone().to_arcsort();
 
         // The proof "term form" of a vec: `(vec-of e0 e1 ...)`, or `(vec-empty)`
@@ -216,10 +216,9 @@ impl ContainerSort for VecSort {
                 }
             } });
         }
-        let all_vec_sorts = eg
-            .type_info
-            .get_arcsorts_by(|f| f.value_type() == Some(TypeId::of::<VecContainer>()));
-        for fn_sort in eg.type_info.get_sorts::<FunctionSort>() {
+        let all_vec_sorts =
+            eg.get_arcsorts_by(|f| f.value_type() == Some(TypeId::of::<VecContainer>()));
+        for fn_sort in eg.get_sorts::<FunctionSort>() {
             for vec_sort in &all_vec_sorts {
                 try_registering_vec_map(eg, fn_sort.clone(), vec_sort.clone(), arc.clone());
                 if vec_sort.name() != arc.name() {
@@ -257,7 +256,7 @@ impl ContainerSort for VecSort {
  * Register a vec map primitive if the function matches the input and output vec.
  */
 pub(crate) fn try_registering_vec_map(
-    eg: &mut EGraph,
+    eg: &mut TypeInfo,
     fn_: Arc<FunctionSort>,
     input_vec: ArcSort,
     output_vec: ArcSort,
@@ -279,10 +278,9 @@ pub(crate) fn try_registering_vec_map(
     );
 }
 
-pub(crate) fn register_vec_primitives_for_function(eg: &mut EGraph, fn_: Arc<FunctionSort>) {
-    let all_vec_sorts = eg
-        .type_info
-        .get_arcsorts_by(|f| f.value_type() == Some(TypeId::of::<VecContainer>()));
+pub(crate) fn register_vec_primitives_for_function(eg: &mut TypeInfo, fn_: Arc<FunctionSort>) {
+    let all_vec_sorts =
+        eg.get_arcsorts_by(|f| f.value_type() == Some(TypeId::of::<VecContainer>()));
     for input_vec in &all_vec_sorts {
         for output_vec in &all_vec_sorts {
             try_registering_vec_map(eg, fn_.clone(), input_vec.clone(), output_vec.clone());

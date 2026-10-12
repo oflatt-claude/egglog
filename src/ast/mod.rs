@@ -594,6 +594,9 @@ where
     Head: Clone + Display,
     Leaf: Clone + PartialEq + Eq + Display + Hash,
 {
+    /// Structured source retained until preceding declarations have been checked.
+    Unexpanded(Arc<Sexp>),
+
     /// Create a new user-defined sort, which can then
     /// be used in new [`Command::Function`] declarations.
     /// The [`Command::Datatype`] command desugars directly to this command, with one [`Command::Function`]
@@ -1007,6 +1010,7 @@ where
 {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
+            GenericCommand::Unexpanded(syntax) => write!(f, "{syntax}"),
             GenericCommand::Rewrite(name, rewrite, subsume) => {
                 rewrite.fmt_with_ruleset(f, name, false, *subsume)
             }
@@ -1567,10 +1571,10 @@ where
 }
 pub type Action = GenericAction<String, String>;
 pub(crate) type MappedAction = GenericAction<CorrespondingVar<String, String>, String>;
-pub(crate) type ResolvedAction = GenericAction<ResolvedCall, ResolvedVar>;
+pub type ResolvedAction = GenericAction<ResolvedCall, ResolvedVar>;
 
 pub type Actions = GenericActions<String, String>;
-pub(crate) type ResolvedActions = GenericActions<ResolvedCall, ResolvedVar>;
+pub type ResolvedActions = GenericActions<ResolvedCall, ResolvedVar>;
 pub(crate) type MappedActions<Head, Leaf> = GenericActions<CorrespondingVar<Head, Leaf>, Leaf>;
 
 pub type Rule = GenericRule<String, String>;
@@ -1697,6 +1701,7 @@ where
         Leaf: Clone + PartialEq + Eq + Display + Hash,
     {
         match self {
+            GenericCommand::Unexpanded(syntax) => GenericCommand::Unexpanded(syntax),
             GenericCommand::Sort {
                 span,
                 name,
@@ -1978,6 +1983,7 @@ where
         Leaf2: Clone + PartialEq + Eq + Display + Hash,
     {
         match self {
+            GenericCommand::Unexpanded(syntax) => GenericCommand::Unexpanded(syntax),
             GenericCommand::Sort {
                 span,
                 name,

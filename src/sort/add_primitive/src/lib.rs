@@ -279,7 +279,7 @@ fn build_add_primitive_impl(parsed: AddPrimitive, validator: Option<Expr>) -> To
             }
         }
 
-        let eg: &mut EGraph = #eg;
+        let eg = &mut *(#eg);
         #add_call
     }}
     .into()

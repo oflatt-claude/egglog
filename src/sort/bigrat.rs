@@ -18,7 +18,7 @@ impl BaseSort for BigRatSort {
     }
 
     #[rustfmt::skip]
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         add_primitive!(eg, "+" = |a: Q, b: Q| -?> Q { a.checked_add(&b).map(Q::new) });
         add_primitive!(eg, "-" = |a: Q, b: Q| -?> Q { a.checked_sub(&b).map(Q::new) });
         add_primitive!(eg, "*" = |a: Q, b: Q| -?> Q { a.checked_mul(&b).map(Q::new) });

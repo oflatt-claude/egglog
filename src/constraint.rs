@@ -187,7 +187,13 @@ where
         assignment: &mut Assignment<Var, Value>,
         key: fn(&Value) -> &str,
     ) -> Result<bool, ConstraintError<Var, Value>> {
-        match (assignment.0.get(&self.0), assignment.0.get(&self.1)) {
+        let mut changed = false;
+        for (from, to) in [(&self.0, &self.1), (&self.1, &self.0)] {
+            for requirement in assignment.1.get(from).cloned().unwrap_or_default() {
+                changed |= assignment.require(to.clone(), requirement)?;
+            }
+        }
+        let result = match (assignment.0.get(&self.0), assignment.0.get(&self.1)) {
             (Some(value), None) => {
                 assignment.insert(self.1.clone(), value.clone());
                 Ok(true)
@@ -208,7 +214,9 @@ where
                 }
             }
             (None, None) => Ok(false),
-        }
+        };
+        assignment.validate()?;
+        result.map(|updated| changed || updated)
     }
 
     fn pretty(&self) -> String {
@@ -317,7 +325,11 @@ where
 
         let cs = std::mem::take(&mut self.0);
         for mut c in cs {
-            let result = c.update(assignment, key);
+            *assignment = orig_assignment.clone();
+            let result = c.update(assignment, key).and_then(|changed| {
+                assignment.validate()?;
+                Ok(changed)
+            });
             match result {
                 Ok(updated) => {
                     success_count += 1;
@@ -401,6 +413,11 @@ where
 /// These represent various ways that constraint satisfaction can fail.
 #[derive(Debug)]
 pub enum ConstraintError<Var, Value> {
+    RejectedSort {
+        var: Var,
+        description: String,
+        value: Value,
+    },
     /// A variable was assigned two different, incompatible values
     InconsistentConstraint(Var, Value, Value),
     /// A variable in the constraint range was not assigned any value
@@ -415,6 +432,15 @@ impl ConstraintError<AtomTerm, ArcSort> {
     /// Converts a [`ConstraintError`] produced by type checking into a type error.
     pub fn to_type_error(&self) -> TypeError {
         match &self {
+            ConstraintError::RejectedSort {
+                var,
+                description,
+                value,
+            } => TypeError::SortPredicate {
+                expr: var.to_expr(),
+                description: description.clone(),
+                actual: value.clone(),
+            },
             ConstraintError::InconsistentConstraint(x, v1, v2) => TypeError::Mismatch {
                 expr: x.to_expr(),
                 expected: v1.clone(),
@@ -484,13 +510,65 @@ impl<Var, Value> Default for Problem<Var, Value> {
 /// This is the result of constraint solving.
 /// Uses an immutable HashMap for efficient cloning during constraint solving.
 #[derive(Clone)]
-pub struct Assignment<Var, Value>(pub HashMap<Var, Value>);
+pub struct Assignment<Var, Value>(
+    pub HashMap<Var, Value>,
+    HashMap<Var, Vec<SortRequirement<Value>>>,
+);
+
+#[derive(Clone)]
+struct SortRequirement<Value> {
+    description: String,
+    predicate: fn(&Value) -> bool,
+}
 
 impl<Var, Value> Assignment<Var, Value>
 where
     Var: Hash + cmp::Eq + PartialEq + Clone,
     Value: Clone,
 {
+    fn require(
+        &mut self,
+        var: Var,
+        requirement: SortRequirement<Value>,
+    ) -> Result<bool, ConstraintError<Var, Value>> {
+        if let Some(value) = self.0.get(&var)
+            && !(requirement.predicate)(value)
+        {
+            return Err(ConstraintError::RejectedSort {
+                var,
+                description: requirement.description,
+                value: value.clone(),
+            });
+        }
+        let mut requirements = self.1.get(&var).cloned().unwrap_or_default();
+        if requirements.iter().any(|old| {
+            old.description == requirement.description
+                && std::ptr::fn_addr_eq(old.predicate, requirement.predicate)
+        }) {
+            return Ok(false);
+        }
+        requirements.push(requirement);
+        self.1.insert(var, requirements);
+        Ok(true)
+    }
+
+    fn validate(&self) -> Result<(), ConstraintError<Var, Value>> {
+        for (var, requirements) in &self.1 {
+            if let Some(value) = self.0.get(var) {
+                for requirement in requirements {
+                    if !(requirement.predicate)(value) {
+                        return Err(ConstraintError::RejectedSort {
+                            var: var.clone(),
+                            description: requirement.description.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Insert into the assignment.
     pub fn insert(&mut self, var: Var, value: Value) -> Option<Value> {
         self.0.insert(var, value)
@@ -710,7 +788,7 @@ where
         mut self,
         key: fn(&Value) -> &str,
     ) -> Result<Assignment<Var, Value>, ConstraintError<Var, Value>> {
-        let mut assignment = Assignment(HashMap::default());
+        let mut assignment = Assignment(HashMap::default(), HashMap::default());
         let mut changed = true;
         while changed {
             changed = false;
@@ -719,6 +797,7 @@ where
             }
         }
 
+        assignment.validate()?;
         for v in self.range.iter() {
             if !assignment.0.contains_key(v) {
                 return Err(ConstraintError::UnconstrainedVar(v.clone()));
@@ -930,7 +1009,7 @@ fn get_atom_application_constraints(
         // most one definition should survive this filter and the XOR
         // resolves cleanly.
         for p in primitives {
-            if p.context_ids[ctx].is_none() {
+            if !p.is_valid_in_context(ctx) {
                 continue;
             }
             let constraints = p.primitive.get_type_constraints(span).get(args, type_info);
@@ -1201,4 +1280,42 @@ pub(crate) fn grounded_check(
     })?;
 
     Ok(())
+}
+
+/// Require a property of a sort once it is inferred, without guessing a sort.
+pub fn sort_predicate(
+    term: AtomTerm,
+    description: &str,
+    predicate: fn(&ArcSort) -> bool,
+) -> Box<dyn Constraint<AtomTerm, ArcSort>> {
+    Box::new(SortPredicate {
+        term,
+        description: description.into(),
+        predicate,
+    })
+}
+#[derive(Clone)]
+struct SortPredicate {
+    term: AtomTerm,
+    description: String,
+    predicate: fn(&ArcSort) -> bool,
+}
+impl Constraint<AtomTerm, ArcSort> for SortPredicate {
+    fn update(
+        &mut self,
+        assignment: &mut Assignment<AtomTerm, ArcSort>,
+        _key: fn(&ArcSort) -> &str,
+    ) -> Result<bool, ConstraintError<AtomTerm, ArcSort>> {
+        assignment.require(
+            self.term.clone(),
+            SortRequirement {
+                description: self.description.clone(),
+                predicate: self.predicate,
+            },
+        )
+    }
+
+    fn pretty(&self) -> String {
+        format!("{:?} must be {}", self.term, self.description)
+    }
 }

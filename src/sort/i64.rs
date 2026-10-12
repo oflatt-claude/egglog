@@ -25,7 +25,7 @@ impl BaseSort for I64Sort {
     }
 
     #[rustfmt::skip]
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         add_literal_prim!(eg, "+" = |a: i64, b: i64| -?> i64 { a.checked_add(b) });
         add_literal_prim!(eg, "-" = |a: i64, b: i64| -?> i64 { a.checked_sub(b) });
         add_literal_prim!(eg, "*" = |a: i64, b: i64| -?> i64 { a.checked_mul(b) });

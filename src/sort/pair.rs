@@ -141,7 +141,7 @@ impl ContainerSort for PairSort {
         ]
     }
 
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         let arc = self.clone().to_arcsort();
 
         // The proof "term form" of a pair: an s-expr `(pair a b)` headed by

@@ -3,11 +3,11 @@ pub mod api;
 pub mod ast;
 #[cfg(feature = "bin")]
 mod cli;
-mod command_macro;
 pub mod constraint;
 mod core;
 mod exec_state;
 pub mod extract;
+pub mod macros;
 pub mod prelude;
 mod proofs;
 
@@ -17,7 +17,6 @@ pub mod sort;
 mod termdag;
 mod typechecking;
 pub mod util;
-pub use command_macro::{CommandMacro, CommandMacroRegistry};
 
 // This is used to allow the `add_primitive` macro to work in
 // both this crate and other crates by referring to `::egglog`.
@@ -72,9 +71,9 @@ use std::sync::Arc;
 pub use termdag::{OrdTerm, Term, TermDag, TermId};
 use thiserror::Error;
 pub use typechecking::FuncType;
-pub use typechecking::PrimitiveValidator;
 pub use typechecking::TypeError;
 pub use typechecking::TypeInfo;
+pub use typechecking::{PrimitiveDefinition, PrimitiveValidator};
 use util::*;
 
 use crate::ast::desugar::desugar_command;
@@ -316,9 +315,10 @@ pub struct EGraph {
     functions: IndexMap<String, Function>,
     rulesets: IndexMap<String, Ruleset>,
     pub fact_directory: Option<PathBuf>,
-    pub seminaive: bool,
     pub no_decomp: bool,
     type_info: TypeInfo,
+    primitive_runtimes: typechecking::PrimitiveRuntimes,
+    installed_sorts: HashSet<String>,
     /// The run report unioned over all runs so far.
     overall_run_report: RunReport,
     schedulers: DenseIdMap<SchedulerId, SchedulerRecord>,
@@ -326,8 +326,6 @@ pub struct EGraph {
     extension_state: HashMap<TypeId, Box<dyn ExtensionStateValue>>,
     strict_mode: bool,
     warned_about_global_prefix: bool,
-    /// Registry for command-level macros
-    command_macros: CommandMacroRegistry,
     proof_state: EncodingState,
     /// In proof mode, this is the program before proof instrumentation and the version we use for proof checking.
     proof_check_program: Vec<ResolvedNCommand>,
@@ -339,6 +337,18 @@ pub struct EGraph {
 /// Compared to an external function, a user-defined command is more powerful because
 /// it has an exclusive access to the e-graph.
 pub trait UserDefinedCommand: Send + Sync {
+    /// Establish declarations during both resolve-only and execution pipelines.
+    /// This hook has no access to runtime state. `update` installs or executes
+    /// the corresponding runtime operation after checking succeeds.
+    fn declare(
+        &self,
+        _types: &mut TypeInfo,
+        _symbols: &mut SymbolGen,
+        _args: &[Expr],
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Run the command with the given arguments.
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error>;
 }
@@ -416,73 +426,20 @@ impl Default for EGraph {
             functions: Default::default(),
             rulesets: Default::default(),
             fact_directory: None,
-            seminaive: true,
             no_decomp: false,
             overall_run_report: Default::default(),
             type_info: Default::default(),
+            primitive_runtimes: Default::default(),
+            installed_sorts: Default::default(),
             schedulers: Default::default(),
             commands: Default::default(),
             extension_state: Default::default(),
             strict_mode: false,
             warned_about_global_prefix: false,
-            command_macros: Default::default(),
             proof_state,
             proof_check_program: vec![],
         };
-        add_base_sort(&mut eg, UnitSort, span!()).unwrap();
-        add_base_sort(&mut eg, StringSort, span!()).unwrap();
-        add_base_sort(&mut eg, BoolSort, span!()).unwrap();
-        add_base_sort(&mut eg, I64Sort, span!()).unwrap();
-        add_base_sort(&mut eg, F64Sort, span!()).unwrap();
-        add_base_sort(&mut eg, BigIntSort, span!()).unwrap();
-        add_base_sort(&mut eg, BigRatSort, span!()).unwrap();
-        eg.type_info.add_presort::<MapSort>(span!()).unwrap();
-        eg.type_info.add_presort::<SetSort>(span!()).unwrap();
-        eg.type_info.add_presort::<VecSort>(span!()).unwrap();
-        eg.type_info.add_presort::<FunctionSort>(span!()).unwrap();
-        eg.type_info.add_presort::<MultiSetSort>(span!()).unwrap();
-        eg.type_info.add_presort::<PairSort>(span!()).unwrap();
-
-        // Add != with a validator that computes inequality result
-        let neq_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
-            if args.len() == 2 && args[0] != args[1] {
-                // Return unit literal for successful inequality
-                Some(termdag.lit(Literal::Unit))
-            } else {
-                None
-            }
-        };
-        add_primitive_with_validator!(
-            &mut eg,
-            "!=" = |a: #, b: #| -?> () {
-                (a != b).then_some(())
-            },
-            neq_validator
-        );
-
-        add_primitive_with_validator!(
-            &mut eg,
-            "bool-!=" = |a: #, b: #| -> bool {
-                (a != b)
-            },
-            |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
-                if args.len() == 2 {
-                    Some(termdag.lit(Literal::Bool(args[0] != args[1])))
-                } else {
-                    None
-                }
-            }
-        );
-
-        add_primitive!(&mut eg, "value-eq" = |a: #, b: #| -?> () {
-            (a == b).then_some(())
-        });
-        add_primitive!(&mut eg, "ordering-min" = |a: #, b: #| -> # {
-            if a < b { a } else { b }
-        });
-        add_primitive!(&mut eg, "ordering-max" = |a: #, b: #| -> # {
-            if a > b { a } else { b }
-        });
+        eg.install_type_info();
 
         eg.rulesets
             .insert("".into(), Ruleset::Rules(Default::default()));
@@ -527,7 +484,7 @@ impl EGraph {
     /// commands.
     pub fn new_with_term_encoding() -> Self {
         let mut egraph = EGraph::default();
-        egraph.proof_state.original_typechecking = Some(Box::new(egraph.clone()));
+        egraph.proof_state.original_typechecking = Some(egraph.type_info.clone());
         egraph
     }
 
@@ -543,7 +500,7 @@ impl EGraph {
     /// This method is to support the current CLI implementation with egglog-experimental (https://github.com/egraphs-good/egglog/issues/768)
     #[cfg(feature = "bin")]
     pub(crate) fn with_term_encoding_enabled(mut self) -> Self {
-        self.proof_state.original_typechecking = Some(Box::new(self.clone()));
+        self.proof_state.original_typechecking = Some(self.type_info.clone());
         self
     }
 
@@ -575,9 +532,6 @@ impl EGraph {
     /// parallelism.
     pub fn set_num_threads(&mut self, num_threads: usize) {
         self.backend.set_num_threads(num_threads);
-        if let Some(original) = &mut self.proof_state.original_typechecking {
-            original.set_num_threads(num_threads);
-        }
     }
 
     /// Return the number of threads configured for this e-graph.
@@ -618,16 +572,6 @@ impl EGraph {
         &mut self.type_info
     }
 
-    /// Get read-only access to the command macro registry
-    pub fn command_macros(&self) -> &CommandMacroRegistry {
-        &self.command_macros
-    }
-
-    /// Get mutable access to the command macro registry
-    pub fn command_macros_mut(&mut self) -> &mut CommandMacroRegistry {
-        &mut self.command_macros
-    }
-
     pub fn add_command(
         &mut self,
         name: String,
@@ -663,7 +607,7 @@ impl EGraph {
     }
 
     fn ensure_global_name_prefix(&mut self, span: &Span, name: &str) -> Result<(), TypeError> {
-        if name.starts_with(GLOBAL_NAME_PREFIX) {
+        if name.starts_with(GLOBAL_NAME_PREFIX) || self.parser.symbol_gen.is_reserved(name) {
             return Ok(());
         }
         if self.strict_mode {
@@ -788,6 +732,7 @@ impl EGraph {
                         &self.backend,
                         &self.functions,
                         &self.type_info,
+                        &self.primitive_runtimes,
                         name,
                         p,
                         self.backend
@@ -965,7 +910,7 @@ impl EGraph {
         if proof_testing {
             proof_check_eg = proof_check_eg.with_proof_testing();
         }
-        let resolved = proof_check_eg.process_program_internal(prog, false)?;
+        let resolved = proof_check_eg.process_program_internal(prog, false, 256)?;
 
         self.proof_check_program = resolved.resolved_before_proofs;
         Ok(())
@@ -1193,22 +1138,23 @@ impl EGraph {
         // evaluation. This widens primitive-context selection from
         // Pure/Write to Read/Full, so primitives that read or write the
         // database can run inside this rule.
-        let seminaive = self.seminaive && !rule.eval_mode.is_naive();
+        let seminaive = self.type_info.seminaive && !rule.eval_mode.is_naive();
         // The `:no-decomp` rule option (and the global `--no-decomp`
         // flag) skips tree-decomposition in query planning, forcing
         // the single-bag fast path.
         let no_decomp = self.no_decomp || rule.no_decomp;
-        let requires_read_context = !seminaive
-            || matches!(
-                rule.eval_mode,
-                RuleEvalMode::Naive | RuleEvalMode::UnsafeSeminaive
-            );
+        let requires_read_context = self.type_info.rule_contexts(rule.eval_mode).1 == Context::Full;
 
         let rule_id = {
             let mut rb = self.backend.new_rule(&rule.name, seminaive);
             rb.set_no_decomp(no_decomp);
-            let mut translator =
-                BackendRule::new(rb, &self.functions, &self.type_info, requires_read_context);
+            let mut translator = BackendRule::new(
+                rb,
+                &self.functions,
+                &self.type_info,
+                &self.primitive_runtimes,
+                requires_read_context,
+            );
             translator.query(query, rule.include_subsumed)?;
             translator.actions(actions)?;
             translator.build()
@@ -1253,6 +1199,7 @@ impl EGraph {
             self.backend.new_rule("eval_actions", false),
             &self.functions,
             &self.type_info,
+            &self.primitive_runtimes,
             true, // global action: Read/Full contexts (may read the DB)
         );
         translator.actions(&actions)?;
@@ -1419,24 +1366,22 @@ impl EGraph {
         output_sort: ArcSort,
         context: Context,
     ) -> Result<ResolvedExpr, TypeError> {
-        let mut binding_map = IndexMap::default();
-        binding_map.reserve(bindings.len());
-        for (name, span, sort) in bindings {
-            if binding_map
-                .insert(name.as_str(), (span.clone(), sort.clone()))
-                .is_some()
-            {
-                return Err(TypeError::AlreadyDefined(name.clone(), span.clone()));
-            }
-        }
-        let resolved = self.type_info.typecheck_expr_with_output(
+        let resolved = self.type_info.typecheck_expr_with_bindings_and_output(
             &mut self.parser.symbol_gen,
             expr,
-            &binding_map,
+            bindings,
             output_sort,
             context,
         )?;
-        Ok(remove_globals::remove_globals_expr(resolved))
+        self.install_type_info();
+        Ok(self.bind_expr_primitives(remove_globals::remove_globals_expr(resolved)))
+    }
+
+    /// Bind a standalone checked expression to this database's primitive entry points.
+    /// The database must contain the same primitive registrations as its source environment.
+    pub fn install_resolved_expr(&mut self, expr: ResolvedExpr) -> ResolvedExpr {
+        self.install_type_info();
+        self.bind_expr_primitives(expr)
     }
 
     /// Replace literal `(unstable-fn "...")` targets with hidden evaluator bindings.
@@ -1489,6 +1434,7 @@ impl EGraph {
                         &self.backend,
                         &self.functions,
                         &self.type_info,
+                        &self.primitive_runtimes,
                         name,
                         prim,
                         panic_id,
@@ -1551,6 +1497,7 @@ impl EGraph {
             self.backend.new_rule("eval_resolved_expr", false),
             &self.functions,
             &self.type_info,
+            &self.primitive_runtimes,
             true, // global action: Read/Full contexts (may read the DB)
         );
 
@@ -1642,6 +1589,7 @@ impl EGraph {
             self.backend.new_rule("check_facts", false),
             &self.functions,
             &self.type_info,
+            &self.primitive_runtimes,
             true, // global query: Read context (may read the DB)
         );
         translator.query(&query, true)?;
@@ -2054,17 +2002,38 @@ impl EGraph {
         &mut self,
         command: Command,
     ) -> Result<Vec<ResolvedNCommand>, Error> {
+        if let Command::UserDefined(_, name, args) = &command
+            && let Some(handler) = self.commands.get(name).cloned()
+        {
+            let types = self
+                .proof_state
+                .original_typechecking
+                .as_mut()
+                .unwrap_or(&mut self.type_info);
+            handler.declare(types, &mut self.parser.symbol_gen, args)?;
+        }
         let desugared = desugar_command(command, &mut self.parser, self.proof_state.proof_testing)?;
         if let Some(original_typechecking) = self.proof_state.original_typechecking.as_mut() {
-            // Typecheck using the original egraph
-            // TODO this is ugly- we don't need an entire e-graph just for type information.
-            let typechecked = original_typechecking.typecheck_program(&desugared)?;
+            original_typechecking.seminaive = self.type_info.seminaive;
+            // Source checking uses a standalone environment, without a second database.
+            let mut typechecked = Vec::new();
+            for command in &desugared {
+                if let Some(expanded) =
+                    macros::check_deferred(original_typechecking, &mut self.parser, command)?
+                {
+                    typechecked.extend(expanded);
+                } else {
+                    typechecked.push(
+                        original_typechecking
+                            .typecheck_command(&mut self.parser.symbol_gen, command)?,
+                    );
+                }
+            }
 
             for command in &typechecked {
-                if let Err(reason) = command_supports_proof_encoding(
-                    &command.to_command(),
-                    &original_typechecking.type_info,
-                ) {
+                if let Err(reason) =
+                    command_supports_proof_encoding(&command.to_command(), original_typechecking)
+                {
                     let command_text = format!("{}", command.to_command());
                     return Err(Error::UnsupportedProofCommand {
                         command: command_text,
@@ -2140,36 +2109,32 @@ impl EGraph {
         &mut self,
         program: Vec<Command>,
         run_commands: bool,
+        fuel: usize,
     ) -> Result<ResolvedNCommandsWithOutput, Error> {
         let mut outputs = Vec::new();
         let mut desugared_before_proofs = Vec::new();
         let mut desugared = Vec::new();
 
-        for before_expanded_command in program {
-            // First do user-provided macro expansion for this command,
-            // which may rely on type information from previous commands.
-            let macro_type_info = self
-                .proof_state
-                .original_typechecking
-                .as_ref()
-                .map(|egraph| &egraph.type_info)
-                .unwrap_or(&self.type_info);
-            let macro_expanded = self.command_macros.apply(
-                before_expanded_command,
-                &mut self.parser.symbol_gen,
-                macro_type_info,
-            )?;
-
-            for command in macro_expanded {
+        for command in program {
+            if let Command::Unexpanded(syntax) = command {
+                let expanded = self.process_syntax(
+                    vec![(*syntax).clone()],
+                    run_commands,
+                    fuel.saturating_sub(1),
+                )?;
+                outputs.extend(expanded.outputs);
+                desugared.extend(expanded.resolved);
+                desugared_before_proofs.extend(expanded.resolved_before_proofs);
+                continue;
+            }
+            {
                 // handle include specially- we keep them as-is for desugaring
                 if let Command::Include(span, file) = &command {
                     let s = std::fs::read_to_string(file)
                         .map_err(|e| Error::IoError(file.clone().into(), e, span.clone()))?;
-                    let included_program = self
-                        .parser
-                        .get_program_from_string(Some(file.clone()), &s)?;
-                    // run program internal on these include commands
-                    let resolved = self.process_program_internal(included_program, run_commands)?;
+                    let syntax = Parser::read_syntax(Some(file.clone()), &s)?;
+                    let resolved =
+                        self.process_syntax(syntax, run_commands, fuel.saturating_sub(1))?;
                     outputs.extend(resolved.outputs);
                     desugared.extend(resolved.resolved);
                     desugared_before_proofs.extend(resolved.resolved_before_proofs);
@@ -2206,6 +2171,59 @@ impl EGraph {
         })
     }
 
+    fn process_syntax(
+        &mut self,
+        syntax: Vec<macros::Syntax>,
+        run: bool,
+        fuel: usize,
+    ) -> Result<ResolvedNCommandsWithOutput, Error> {
+        use macros::{Expansion, Fragment, Space};
+        let mut result = ResolvedNCommandsWithOutput {
+            outputs: vec![],
+            resolved: vec![],
+            resolved_before_proofs: vec![],
+        };
+        for form in syntax {
+            if fuel == 0 {
+                return Err(
+                    ParseError(form.span(), "macro expansion exceeded 256 steps".into()).into(),
+                );
+            }
+            self.parser.macro_types = if self.parser.macros.is_empty() {
+                None
+            } else {
+                let mut source = self
+                    .proof_state
+                    .original_typechecking
+                    .as_ref()
+                    .unwrap_or(&self.type_info)
+                    .clone();
+                source.seminaive = self.type_info.seminaive;
+                Some(source)
+            };
+            let expanded = match self.parser.expand(Space::Command, &form)? {
+                Expansion::Syntax(syntax) => self.process_syntax(vec![syntax], run, fuel - 1)?,
+                Expansion::Sequence(syntax) => self.process_syntax(syntax, run, fuel - 1)?,
+                Expansion::Parsed(Fragment::Commands(commands)) => {
+                    self.process_program_internal(commands, run, fuel.saturating_sub(1))?
+                }
+                _ => {
+                    return Err(ParseError(
+                        form.span(),
+                        "command macro must return commands".into(),
+                    )
+                    .into());
+                }
+            };
+            result.outputs.extend(expanded.outputs);
+            result.resolved.extend(expanded.resolved);
+            result
+                .resolved_before_proofs
+                .extend(expanded.resolved_before_proofs);
+        }
+        Ok(result)
+    }
+
     /// Run a program, represented as an AST.
     /// Return a list of messages.
     ///
@@ -2214,20 +2232,20 @@ impl EGraph {
     /// recovery rebuild leaves the database canonical and reusable. Rust panics
     /// in extension code unwind normally instead of becoming [`enum@Error`] values.
     pub fn run_program(&mut self, program: Vec<Command>) -> Result<Vec<CommandOutput>, Error> {
-        let res = self.process_program_internal(program, true)?;
+        let res = self.process_program_internal(program, true, 256)?;
         Ok(res.outputs)
     }
 
     /// Resolves an egglog program by parsing, typechecking, and desugaring each command.
-    /// Outputs a new egglog program without any syntactic sugar, either user provided ([`CommandMacro`]) or built-in (e.g., `rewrite` commands).
+    /// Outputs a new egglog program without any syntactic sugar, either user provided (macros) or built-in (e.g., `rewrite` commands).
     /// Also removes globals from the program by replacing with new constructors.
     pub fn resolve_program(
         &mut self,
         filename: Option<String>,
         input: &str,
     ) -> Result<Vec<ResolvedCommand>, Error> {
-        let parsed = self.parser.get_program_from_string(filename, input)?;
-        let res = self.process_program_internal(parsed, false)?;
+        let syntax = Parser::read_syntax(filename, input)?;
+        let res = self.process_syntax(syntax, false, 256)?;
         Ok(res.resolved.into_iter().map(|c| c.to_command()).collect())
     }
 
@@ -2251,8 +2269,8 @@ impl EGraph {
         filename: Option<String>,
         input: &str,
     ) -> Result<Vec<CommandOutput>, Error> {
-        let parsed = self.parser.get_program_from_string(filename, input)?;
-        self.run_program(parsed)
+        let syntax = Parser::read_syntax(filename, input)?;
+        Ok(self.process_syntax(syntax, true, 256)?.outputs)
     }
 
     /// Get the number of tuples in the database.
@@ -2614,6 +2632,7 @@ fn resolve_function_container_target_with_context(
     backend: &egglog_bridge::EGraph,
     functions: &IndexMap<String, Function>,
     type_info: &TypeInfo,
+    primitive_runtimes: &typechecking::PrimitiveRuntimes,
     name: &str,
     primitive: &core::SpecializedPrimitive,
     panic_id: ExternalFunctionId,
@@ -2692,7 +2711,7 @@ fn resolve_function_container_target_with_context(
         let context_ids = enum_map::EnumMap::from_fn(|runtime_ctx| {
             let mut ids = candidates
                 .iter()
-                .filter_map(|primitive| primitive.context_ids[runtime_ctx]);
+                .filter_map(|primitive| primitive_runtimes[&primitive.id][runtime_ctx]);
             // The first `next` finds the candidate for this runtime context;
             // the second detects whether there is more than one such candidate.
             match (ids.next(), ids.next()) {
@@ -2743,6 +2762,7 @@ struct BackendRule<'a> {
     entries: HashMap<core::ResolvedAtomTerm, QueryEntry>,
     functions: &'a IndexMap<String, Function>,
     type_info: &'a TypeInfo,
+    primitive_runtimes: &'a typechecking::PrimitiveRuntimes,
     /// Whether primitives may read the database. When true the per-phase
     /// [`crate::Context`] widens from `Pure`/`Write` to `Read`/`Full` (query
     /// gains reads, action gains reads on top of writes). True for `:naive` /
@@ -2755,12 +2775,14 @@ impl<'a> BackendRule<'a> {
         rb: egglog_bridge::RuleBuilder<'a>,
         functions: &'a IndexMap<String, Function>,
         type_info: &'a TypeInfo,
+        primitive_runtimes: &'a typechecking::PrimitiveRuntimes,
         requires_read_context: bool,
     ) -> BackendRule<'a> {
         BackendRule {
             rb,
             functions,
             type_info,
+            primitive_runtimes,
             requires_read_context,
             entries: Default::default(),
         }
@@ -2769,7 +2791,7 @@ impl<'a> BackendRule<'a> {
     /// The [`crate::Context`] that applies when compiling
     /// primitives on the query side (LHS) of this rule. Under
     /// seminaive evaluation, queries are pure (no DB reads or
-    /// writes); a `:naive` rule (or `eg.seminaive = false`) widens
+    /// writes); a `:naive` rule (or `eg.set_seminaive(false)`) widens
     /// this to [`Context::Read`] so reads from primitives are
     /// admissible.
     fn query_context(&self) -> crate::Context {
@@ -2821,7 +2843,7 @@ impl<'a> BackendRule<'a> {
         // The typechecker has already checked that this primitive is
         // valid in `ctx`; pick the runtime id that stamps the same ctx
         // onto the state wrapper when invoked.
-        let resolved_id = prim.external_id(ctx);
+        let resolved_id = prim.runtime_id(self.primitive_runtimes, ctx);
 
         let mut qe_args = self.args(args);
 
@@ -2845,6 +2867,7 @@ impl<'a> BackendRule<'a> {
                 self.rb.egraph(),
                 self.functions,
                 self.type_info,
+                self.primitive_runtimes,
                 name,
                 prim,
                 panic_id,

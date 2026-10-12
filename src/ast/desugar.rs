@@ -4,12 +4,19 @@ use crate::*;
 use egglog_ast::span::Span;
 
 /// Desugars a single command, removing syntactic sugar.
-pub(crate) fn desugar_command(
+pub fn desugar_command(
     command: Command,
     parser: &mut Parser,
     proof_testing: bool,
 ) -> Result<Vec<NCommand>, Error> {
     let res = match command {
+        Command::Unexpanded(syntax) => {
+            return Err(ParseError(
+                syntax.span(),
+                "expand source commands before desugaring".into(),
+            )
+            .into());
+        }
         Command::Function {
             span,
             name,

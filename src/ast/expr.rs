@@ -52,7 +52,7 @@ pub type ResolvedExpr = GenericExpr<ResolvedCall, ResolvedVar>;
 /// A useful operation on `MappedExpr`s is [`MappedExprExt::get_corresponding_var_or_lit``].
 pub(crate) type MappedExpr<Head, Leaf> = GenericExpr<CorrespondingVar<Head, Leaf>, Leaf>;
 
-pub(crate) trait ResolvedExprExt {
+pub trait ResolvedExprExt {
     fn output_type(&self) -> ArcSort;
     fn get_global_var(&self) -> Option<ResolvedVar>;
 }

@@ -183,7 +183,7 @@ impl ContainerSort for MapSort {
             .collect()
     }
 
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         let arc = self.clone().to_arcsort();
 
         // The proof "term form" of a map is the flat `(map-of k0 v0 k1 v1 ...)`

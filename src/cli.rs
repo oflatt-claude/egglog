@@ -107,7 +107,7 @@ pub fn cli(mut egraph: EGraph) {
     }
 
     egraph.fact_directory.clone_from(&args.fact_directory);
-    egraph.seminaive = !args.naive;
+    egraph.set_seminaive(!args.naive);
     egraph.no_decomp = args.no_decomp;
     egraph.set_report_level(args.report_level);
     if args.strict_mode {

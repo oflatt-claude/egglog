@@ -11,7 +11,7 @@ impl BaseSort for BoolSort {
     }
 
     #[rustfmt::skip]
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         add_literal_prim!(eg, "not" = |a: bool| -> bool { !a });
         add_literal_prim!(eg, "and" = |a: bool, b: bool| -> bool { a && b });
         let or_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {

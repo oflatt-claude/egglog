@@ -136,7 +136,7 @@ impl ContainerSort for SetSort {
             .collect()
     }
 
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         let arc = self.clone().to_arcsort();
 
         // Proof term form of a set: `(set-of e0 e1 ...)` sorted and

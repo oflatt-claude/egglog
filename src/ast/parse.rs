@@ -38,20 +38,25 @@ macro_rules! error {
     };
 }
 
+#[derive(Clone, Debug)]
 pub enum Sexp {
     // Will never contain `Literal::Unit`, as this
     // will be parsed as an empty `Sexp::List`.
     Literal(Literal, Span),
     Atom(String, Span),
+    Generated(String, Span),
     List(Vec<Sexp>, Span),
+    Parsed(Arc<crate::macros::Fragment>, Span),
+    Bound(crate::macros::MacroBinding, Box<Sexp>),
 }
 
 impl Sexp {
     pub fn span(&self) -> Span {
         match self {
             Sexp::Literal(_, span) => span.clone(),
-            Sexp::Atom(_, span) => span.clone(),
-            Sexp::List(_, span) => span.clone(),
+            Sexp::Atom(_, span) | Sexp::Generated(_, span) => span.clone(),
+            Sexp::List(_, span) | Sexp::Parsed(_, span) => span.clone(),
+            Sexp::Bound(_, input) => input.span(),
         }
     }
 
@@ -76,7 +81,7 @@ impl Sexp {
     }
 
     pub fn expect_atom(&self, e: &'static str) -> Result<String, ParseError> {
-        if let Sexp::Atom(symbol, _) = self {
+        if let Sexp::Atom(symbol, _) | Sexp::Generated(symbol, _) = self {
             return Ok(symbol.clone());
         }
         error!(self.span(), "expected {e}")
@@ -91,7 +96,7 @@ impl Sexp {
 
     pub fn expect_call(&self, e: &'static str) -> Result<(String, &[Sexp], Span), ParseError> {
         if let Sexp::List(sexps, span) = self
-            && let [Sexp::Atom(func, _), args @ ..] = sexps.as_slice()
+            && let [Sexp::Atom(func, _) | Sexp::Generated(func, _), args @ ..] = sexps.as_slice()
         {
             return Ok((func.clone(), args, span.clone()));
         }
@@ -137,43 +142,12 @@ fn parse_container_rebuild_spec(sexp: &Sexp) -> Result<ContainerRebuildSpec, Par
     })
 }
 
-pub trait Macro<T>: Send + Sync {
-    fn name(&self) -> &str;
-    fn parse(&self, args: &[Sexp], span: Span, parser: &mut Parser) -> Result<T, ParseError>;
-}
-
-pub struct SimpleMacro<T, F: Fn(&[Sexp], Span, &mut Parser) -> Result<T, ParseError> + Send + Sync>(
-    String,
-    F,
-);
-
-impl<T, F> SimpleMacro<T, F>
-where
-    F: Fn(&[Sexp], Span, &mut Parser) -> Result<T, ParseError> + Send + Sync,
-{
-    pub fn new(head: &str, f: F) -> Self {
-        Self(head.to_owned(), f)
-    }
-}
-
-impl<T, F> Macro<T> for SimpleMacro<T, F>
-where
-    F: Fn(&[Sexp], Span, &mut Parser) -> Result<T, ParseError> + Send + Sync,
-{
-    fn name(&self) -> &str {
-        &self.0
-    }
-
-    fn parse(&self, args: &[Sexp], span: Span, parser: &mut Parser) -> Result<T, ParseError> {
-        self.1(args, span, parser)
-    }
-}
-
 #[derive(Clone)]
 pub struct Parser {
-    commands: HashMap<String, Arc<dyn Macro<Vec<Command>>>>,
-    actions: HashMap<String, Arc<dyn Macro<Vec<Action>>>>,
-    exprs: HashMap<String, Arc<dyn Macro<Expr>>>,
+    pub(crate) macros: crate::macros::MacroRegistry,
+    pub(crate) macro_types: Option<TypeInfo>,
+    pub(crate) deferred: IndexMap<String, crate::macros::DeferredCall>,
+    pub(crate) expansion_depth: usize,
     user_defined: HashSet<String>,
     pub symbol_gen: SymbolGen,
     pub ensure_no_reserved_symbols: bool,
@@ -182,9 +156,10 @@ pub struct Parser {
 impl Default for Parser {
     fn default() -> Self {
         Self {
-            commands: Default::default(),
-            actions: Default::default(),
-            exprs: Default::default(),
+            macros: Default::default(),
+            macro_types: None,
+            deferred: Default::default(),
+            expansion_depth: 0,
             user_defined: Default::default(),
             symbol_gen: SymbolGen::new(INTERNAL_SYMBOL_PREFIX.to_string()),
             ensure_no_reserved_symbols: true,
@@ -210,6 +185,12 @@ impl Parser {
         input: &str,
     ) -> Result<Vec<Command>, ParseError> {
         let sexps = all_sexps(SexpParser::new(filename, input))?;
+        if !self.macros.is_empty() {
+            return Ok(sexps
+                .into_iter()
+                .map(|syntax| Command::Unexpanded(Arc::new(syntax)))
+                .collect());
+        }
         let nested: Vec<Vec<_>> = map_fallible(&sexps, self, Self::parse_command)?;
         Ok(nested.into_iter().flatten().collect())
     }
@@ -243,35 +224,13 @@ impl Parser {
         self.parse_fact(&sexp)
     }
 
-    pub fn add_command_macro(&mut self, ma: Arc<dyn Macro<Vec<Command>>>) {
-        self.commands.insert(ma.name().to_owned(), ma);
-    }
-
-    pub fn add_action_macro(&mut self, ma: Arc<dyn Macro<Vec<Action>>>) {
-        self.actions.insert(ma.name().to_owned(), ma);
-    }
-
-    pub fn add_expr_macro(&mut self, ma: Arc<dyn Macro<Expr>>) {
-        self.exprs.insert(ma.name().to_owned(), ma);
-    }
-
     pub(crate) fn add_user_defined(&mut self, name: String) -> Result<(), Error> {
-        if self.actions.contains_key(&name)
-            || self.exprs.contains_key(&name)
-            || self.commands.contains_key(&name)
-        {
-            return Err(Error::CommandAlreadyExists(name, span!()));
-        }
         self.user_defined.insert(name);
         Ok(())
     }
 
-    pub fn parse_command(&mut self, sexp: &Sexp) -> Result<Vec<Command>, ParseError> {
+    pub(crate) fn parse_core_command(&mut self, sexp: &Sexp) -> Result<Vec<Command>, ParseError> {
         let (head, tail, span) = sexp.expect_call("command")?;
-
-        if let Some(macr0) = self.commands.get(&head).cloned() {
-            return macr0.parse(tail, span, self);
-        }
 
         // This prevents user-defined commands from being parsed as built-in commands.
         if self.user_defined.contains(&head) {
@@ -856,7 +815,7 @@ impl Parser {
         })
     }
 
-    pub fn parse_schedule(&mut self, sexp: &Sexp) -> Result<Schedule, ParseError> {
+    pub(crate) fn parse_core_schedule(&mut self, sexp: &Sexp) -> Result<Schedule, ParseError> {
         if let Sexp::Atom(ruleset, span) = sexp {
             return Ok(Schedule::Run(
                 span.clone(),
@@ -914,19 +873,17 @@ impl Parser {
         })
     }
 
-    pub fn parse_action(&mut self, sexp: &Sexp) -> Result<Vec<Action>, ParseError> {
+    pub(crate) fn parse_core_action(&mut self, sexp: &Sexp) -> Result<Vec<Action>, ParseError> {
         let (head, tail, span) = sexp.expect_call("action")?;
-
-        if let Some(func) = self.actions.get(&head).cloned() {
-            return func.parse(tail, span, self);
-        }
 
         Ok(match head.as_str() {
             "let" => match tail {
                 [name, value] => {
                     let binding_span = name.span();
                     let binding = name.expect_atom("binding name")?;
-                    self.ensure_symbol_not_reserved(&binding, &binding_span)?;
+                    if !matches!(name, Sexp::Generated(..)) {
+                        self.ensure_symbol_not_reserved(&binding, &binding_span)?;
+                    }
                     vec![Action::Let(span, binding, self.parse_expr(value)?)]
                 }
                 _ => return error!(span, "usage: (let <name> <expr>)"),
@@ -972,7 +929,7 @@ impl Parser {
         })
     }
 
-    pub fn parse_fact(&mut self, sexp: &Sexp) -> Result<Fact, ParseError> {
+    pub(crate) fn parse_core_fact(&mut self, sexp: &Sexp) -> Result<Fact, ParseError> {
         let (head, tail, span) = sexp.expect_call("fact")?;
 
         Ok(match head.as_str() {
@@ -984,8 +941,10 @@ impl Parser {
         })
     }
 
-    pub fn parse_expr(&mut self, sexp: &Sexp) -> Result<Expr, ParseError> {
+    pub(crate) fn parse_core_expr(&mut self, sexp: &Sexp) -> Result<Expr, ParseError> {
         Ok(match sexp {
+            Sexp::Parsed(_, _) | Sexp::Bound(_, _) => return self.parse_expr(sexp),
+            Sexp::Generated(symbol, span) => Expr::Var(span.clone(), symbol.clone()),
             Sexp::Literal(literal, span) => Expr::Lit(span.clone(), literal.clone()),
             Sexp::Atom(symbol, span) => Expr::Var(
                 span.clone(),
@@ -1000,10 +959,6 @@ impl Parser {
                 [] => Expr::Lit(span.clone(), Literal::Unit),
                 _ => {
                     let (head, tail, span) = sexp.expect_call("call expression")?;
-
-                    if let Some(func) = self.exprs.get(&head).cloned() {
-                        return func.parse(tail, span, self);
-                    }
 
                     Expr::Call(
                         span.clone(),
@@ -1301,6 +1256,28 @@ pub(crate) fn all_sexps(mut ctx: SexpParser) -> Result<Vec<Sexp>, ParseError> {
     Ok(sexps)
 }
 
+impl Display for Sexp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Literal(literal, _) => write!(f, "{literal}"),
+            Self::Atom(name, _) | Self::Generated(name, _) => write!(f, "{name}"),
+            Self::List(items, _) => write!(f, "({})", ListDisplay(items, " ")),
+            Self::Bound(_, syntax) => write!(f, "{syntax}"),
+            Self::Parsed(fragment, _) => match &**fragment {
+                crate::macros::Fragment::Commands(commands) => {
+                    write!(f, "{}", ListDisplay(commands, "\n"))
+                }
+                crate::macros::Fragment::Actions(actions) => {
+                    write!(f, "{}", ListDisplay(actions, " "))
+                }
+                crate::macros::Fragment::Expr(expr) => write!(f, "{expr}"),
+                crate::macros::Fragment::Fact(fact) => write!(f, "{fact}"),
+                crate::macros::Fragment::Schedule(schedule) => write!(f, "{schedule}"),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,13 +1337,21 @@ mod tests {
     fn test_parser_macros() {
         let mut parser = Parser::default();
         let y = "xxxx";
-        parser.add_expr_macro(Arc::new(SimpleMacro::new("qqqq", |tail, span, macros| {
-            Ok(Expr::Call(
-                span,
-                y.into(),
-                map_fallible(tail, macros, Parser::parse_expr)?,
-            ))
-        })));
+        parser.macros().register(
+            crate::macros::Space::Expr,
+            "qqqq",
+            Arc::new(
+                move |input: &Sexp, cx: &mut crate::macros::MacroContext<'_>| {
+                    let (_, tail, span) = input.expect_call("qqqq")?;
+                    Ok(crate::macros::Fragment::Expr(Expr::Call(
+                        span,
+                        y.into(),
+                        map_fallible(tail, cx.parser(), Parser::parse_expr)?,
+                    ))
+                    .into())
+                },
+            ),
+        );
         let s = r#"(f (qqqq a 3) 4.0 (H "hello"))"#;
         let t = r#"(f (xxxx a 3) 4.0 (H "hello"))"#;
         let e = parser.get_expr_from_string(None, s).unwrap();

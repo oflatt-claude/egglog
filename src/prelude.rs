@@ -157,10 +157,10 @@ use std::any::{Any, TypeId};
 
 // Re-exports in `prelude` for convenience.
 pub use egglog::ast::{Action, Fact, Facts, GenericActions, RustSpan, Span};
+pub use egglog::macros::{Expansion, Macro, MacroContext, MacroRegistry, Space, Syntax};
 pub use egglog::sort::{BigIntSort, BigRatSort, BoolSort, F64Sort, I64Sort, StringSort, UnitSort};
-pub use egglog::{CommandMacro, CommandMacroRegistry};
 pub use egglog::{Core, FullState, PureState, Read, ReadState, Write, WriteState};
-pub use egglog::{EGraph, span};
+pub use egglog::{EGraph, TypeInfo, span};
 pub use egglog::{action, actions, datatype, expr, fact, facts, sort, vars};
 
 /// Trait for types that can be converted to/from Literal for use in validated primitives.
@@ -843,7 +843,7 @@ macro_rules! datatype {
 pub trait BaseSort: Any + Send + Sync + Debug {
     type Base: BaseValue;
     fn name(&self) -> &str;
-    fn register_primitives(&self, _eg: &mut EGraph) {}
+    fn register_primitives(&self, _eg: &mut TypeInfo) {}
     fn reconstruct_termdag(&self, _: &BaseValues, _: Value, _: &mut TermDag) -> TermId;
 
     fn to_arcsort(self) -> ArcSort
@@ -878,7 +878,7 @@ impl<T: BaseSort> Sort for BaseSortImpl<T> {
         self
     }
 
-    fn register_primitives(self: Arc<Self>, eg: &mut EGraph) {
+    fn register_primitives(self: Arc<Self>, eg: &mut TypeInfo) {
         self.0.register_primitives(eg)
     }
 
@@ -905,7 +905,7 @@ pub trait ContainerSort: Any + Send + Sync + Debug {
     fn is_eq_container_sort(&self) -> bool;
     fn inner_sorts(&self) -> Vec<ArcSort>;
     fn inner_values(&self, _: &ContainerValues, _: Value) -> Vec<(ArcSort, Value)>;
-    fn register_primitives(&self, _eg: &mut EGraph) {}
+    fn register_primitives(&self, _eg: &mut TypeInfo) {}
     fn reconstruct_termdag(
         &self,
         _: &ContainerValues,
@@ -979,7 +979,7 @@ impl<T: ContainerSort> Sort for ContainerSortImpl<T> {
         self.0.serialized_name(container_values, value)
     }
 
-    fn register_primitives(self: Arc<Self>, eg: &mut EGraph) {
+    fn register_primitives(self: Arc<Self>, eg: &mut TypeInfo) {
         self.0.register_primitives(eg);
     }
 

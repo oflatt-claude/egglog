@@ -128,9 +128,10 @@ impl ProofInstrumentor<'_> {
     }
 
     pub(crate) fn parse_program(&mut self, input: &str) -> Vec<Command> {
-        self.egraph.parser.ensure_no_reserved_symbols = false;
-        let res = self.egraph.parser.get_program_from_string(None, input);
-        self.egraph.parser.ensure_no_reserved_symbols = true;
+        let res = self
+            .egraph
+            .parser
+            .with_core(|parser| parser.get_program_from_string(None, input));
 
         // This program is generated internally by term encoding, so a parse
         // failure is an egglog bug rather than a user error.
@@ -169,33 +170,33 @@ impl ProofInstrumentor<'_> {
 
     /// Internal parse helper for term encoding- parse and crash on failure.
     pub(crate) fn parse_schedule(&mut self, input: String) -> Schedule {
-        self.egraph.parser.ensure_no_reserved_symbols = false;
-        let res = self.egraph.parser.get_schedule_from_string(None, &input);
-        self.egraph.parser.ensure_no_reserved_symbols = true;
+        let res = self
+            .egraph
+            .parser
+            .with_core(|parser| parser.get_schedule_from_string(None, &input));
         res.expect("internally generated term-encoding schedule must parse")
     }
 
     /// Internal parse helper for term encoding- parse and crash on failure.
     pub(crate) fn parse_facts(&mut self, input: &[String]) -> Vec<Fact> {
-        self.egraph.parser.ensure_no_reserved_symbols = false;
-        let res = input
-            .iter()
-            .map(|f| {
-                self.egraph
-                    .parser
-                    .get_fact_from_string(None, f)
-                    .expect("internally generated term-encoding fact must parse")
-            })
-            .collect();
-        self.egraph.parser.ensure_no_reserved_symbols = true;
-        res
+        self.egraph.parser.with_core(|parser| {
+            input
+                .iter()
+                .map(|fact| {
+                    parser
+                        .get_fact_from_string(None, fact)
+                        .expect("internally generated term-encoding fact must parse")
+                })
+                .collect()
+        })
     }
 
     /// Internal parse helper for term encoding- parse an expression and crash on failure.
     pub(crate) fn parse_expr(&mut self, input: &str) -> Expr {
-        self.egraph.parser.ensure_no_reserved_symbols = false;
-        let res = self.egraph.parser.get_expr_from_string(None, input);
-        self.egraph.parser.ensure_no_reserved_symbols = true;
+        let res = self
+            .egraph
+            .parser
+            .with_core(|parser| parser.get_expr_from_string(None, input));
         res.expect("internally generated term-encoding expression must parse")
     }
 

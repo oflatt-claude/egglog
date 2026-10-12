@@ -511,6 +511,7 @@ impl SchedulerRuleInfo {
             qrule,
             &egraph.functions,
             &egraph.type_info,
+            &egraph.primitive_runtimes,
             rule.requires_read_context,
         );
         qrule_builder.query(&rule.core.body, rule.include_subsumed)?;
@@ -538,6 +539,7 @@ impl SchedulerRuleInfo {
             egraph.backend.new_rule(name, false),
             &egraph.functions,
             &egraph.type_info,
+            &egraph.primitive_runtimes,
             rule.requires_read_context,
         );
         let mut entries = free_vars
@@ -682,10 +684,7 @@ mod test {
 
     #[test]
     fn test_naive_scheduler_preserves_residual_matches_without_requerying() {
-        let mut egraph = EGraph {
-            seminaive: false,
-            ..Default::default()
-        };
+        let mut egraph = EGraph::default().with_seminaive(false);
         let scheduler_id = egraph.add_scheduler(Box::new(DrainThreeScheduler));
         let mut input = r#"
             (ruleset test)
@@ -712,10 +711,7 @@ mod test {
         for (case, mut egraph, annotation, requery) in [
             (
                 "global naive",
-                EGraph {
-                    seminaive: false,
-                    ..Default::default()
-                },
+                EGraph::default().with_seminaive(false),
                 "",
                 true,
             ),

@@ -146,7 +146,7 @@ impl ContainerSort for MultiSetSort {
             .collect()
     }
 
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         let arc = self.clone().to_arcsort();
 
         // Proof term form of a multiset: `(multiset-of e0 e1 ...)`, matching
@@ -216,7 +216,7 @@ impl ContainerSort for MultiSetSort {
         });
 
         // Add multiset-sum-multisets if the inner arcsort is also a multiset
-        for other_multiset_sort in eg.type_info.get_arcsorts_by(|f| {
+        for other_multiset_sort in eg.get_arcsorts_by(|f| {
             f.name() == self.element.name()
             // We can't query directly by arcsort type since it's wrapped in a ContainerSort which is not public
                 && f.value_type() == Some(TypeId::of::<MultiSetContainer>())
@@ -230,10 +230,9 @@ impl ContainerSort for MultiSetSort {
                 None,
             );
         }
-        let all_ms_sorts = eg
-            .type_info
-            .get_arcsorts_by(|f| f.value_type() == Some(TypeId::of::<MultiSetContainer>()));
-        for fn_sort in eg.type_info.get_sorts::<FunctionSort>() {
+        let all_ms_sorts =
+            eg.get_arcsorts_by(|f| f.value_type() == Some(TypeId::of::<MultiSetContainer>()));
+        for fn_sort in eg.get_sorts::<FunctionSort>() {
             for ms_sort in &all_ms_sorts {
                 try_registering_multiset_map(eg, fn_sort.clone(), ms_sort.clone(), arc.clone());
                 if ms_sort.name() != arc.name() {
@@ -284,7 +283,7 @@ impl ContainerSort for MultiSetSort {
  * Register a multiset map primitive if the function matches the input and output multiset.
  */
 pub(crate) fn try_registering_multiset_map(
-    eg: &mut EGraph,
+    eg: &mut TypeInfo,
     fn_: Arc<FunctionSort>,
     input_ms: ArcSort,
     output_ms: ArcSort,
@@ -306,10 +305,9 @@ pub(crate) fn try_registering_multiset_map(
     );
 }
 
-pub(crate) fn register_multiset_primitives_for_function(eg: &mut EGraph, fn_: Arc<FunctionSort>) {
-    let all_ms_sorts = eg
-        .type_info
-        .get_arcsorts_by(|f| f.value_type() == Some(TypeId::of::<MultiSetContainer>()));
+pub(crate) fn register_multiset_primitives_for_function(eg: &mut TypeInfo, fn_: Arc<FunctionSort>) {
+    let all_ms_sorts =
+        eg.get_arcsorts_by(|f| f.value_type() == Some(TypeId::of::<MultiSetContainer>()));
     for input_ms in &all_ms_sorts {
         for output_ms in &all_ms_sorts {
             try_registering_multiset_map(eg, fn_.clone(), input_ms.clone(), output_ms.clone());
@@ -321,7 +319,7 @@ pub(crate) fn register_multiset_primitives_for_function(eg: &mut EGraph, fn_: Ar
 }
 
 fn try_registering_multiset_non_map_primitives(
-    eg: &mut EGraph,
+    eg: &mut TypeInfo,
     fn_: Arc<FunctionSort>,
     multiset: ArcSort,
 ) {
@@ -373,7 +371,7 @@ fn try_registering_multiset_non_map_primitives(
         && fn_.inputs()[1].name() == element_name
         && fn_.output().name() == "i64"
     {
-        let unit = eg.type_info.get_sort_by_name("Unit").unwrap().clone();
+        let unit = eg.get_sort_by_name("Unit").unwrap().clone();
         eg.add_full_primitive(
             FillIndex {
                 name: "unstable-multiset-fill-index".into(),

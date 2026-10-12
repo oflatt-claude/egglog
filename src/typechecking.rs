@@ -155,20 +155,22 @@ impl Hash for FuncType {
 /// Validators take a termdag and arguments (as TermIds) and return
 /// a newly computed TermId if the primitive application is valid,
 /// or None if it is invalid.
+pub(crate) type PrimitiveRuntime = EnumMap<Context, Option<ExternalFunctionId>>;
+pub(crate) type PrimitiveRuntimes = HashMap<usize, PrimitiveRuntime>;
+
 pub type PrimitiveValidator = Arc<dyn Fn(&mut TermDag, &[TermId]) -> Option<TermId> + Send + Sync>;
 
 #[derive(Clone)]
-pub struct PrimitiveWithId {
+pub struct PrimitiveDefinition {
     pub(crate) primitive: Arc<dyn Primitive>,
     pub(crate) validator: Option<PrimitiveValidator>,
-    /// Runtime entrypoints for the contexts this primitive is valid in.
-    /// The primitive definition is stored once, while each context keeps
-    /// its own backend id so higher-order dispatch can still recover the
-    /// application context at runtime.
-    pub(crate) context_ids: EnumMap<Context, Option<ExternalFunctionId>>,
+    pub(crate) id: usize,
+    pub(crate) valid_contexts: Vec<Context>,
+    pub(crate) install:
+        Option<Arc<dyn Fn(&mut egglog_bridge::EGraph) -> PrimitiveRuntime + Send + Sync>>,
 }
 
-impl PrimitiveWithId {
+impl PrimitiveDefinition {
     /// Takes the full signature of a primitive (both input and output types).
     /// Returns whether the primitive is compatible with this signature.
     pub fn accept(&self, tys: &[Arc<dyn Sort>], typeinfo: &TypeInfo) -> bool {
@@ -193,24 +195,26 @@ impl PrimitiveWithId {
 
     /// Returns whether this primitive has a runtime entrypoint for `context`.
     pub fn is_valid_in_context(&self, context: Context) -> bool {
-        self.context_ids[context].is_some()
+        self.valid_contexts.contains(&context)
     }
 }
 
-impl Debug for PrimitiveWithId {
+impl Debug for PrimitiveDefinition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Prim({})", self.primitive.name())
     }
 }
 
 /// Stores resolved typechecking information.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TypeInfo {
+    /// Whether default rules use seminaive evaluation. Also determines inference contexts.
+    pub seminaive: bool,
     mksorts: HashMap<String, MkSort>,
     // TODO(yz): I want to get rid of this as now we have user-defined primitives and constraint based type checking
     reserved_primitives: HashSet<&'static str>,
     pub(crate) sorts: HashMap<String, Arc<dyn Sort>>,
-    primitives: HashMap<String, Vec<PrimitiveWithId>>,
+    primitives: HashMap<String, Vec<PrimitiveDefinition>>,
     func_types: HashMap<String, Arc<FuncType>>,
     pub(crate) global_sorts: HashMap<String, ArcSort>,
     /// Sorts that do not allow union (e.g., from `:no-union` sorts or relations).
@@ -219,9 +223,7 @@ pub struct TypeInfo {
     pub(crate) hidden_functions: HashSet<String>,
 }
 
-// These methods need to be on the `EGraph` in order to
-// register sorts and primitives with the backend.
-impl EGraph {
+impl TypeInfo {
     /// Add a user-defined sort to the e-graph.
     ///
     /// Also look at [`prelude::add_base_sort`] for a convenience method for adding user-defined sorts
@@ -239,15 +241,15 @@ impl EGraph {
         span: Span,
     ) -> Result<(), TypeError> {
         let name = name.into();
-        if self.type_info.func_types.contains_key(&name) {
+        if self.func_types.contains_key(&name) {
             return Err(TypeError::FunctionAlreadyBound(name, span));
         }
 
         let sort = match presort_and_args {
             None => Arc::new(EqSort { name }),
             Some((presort, args)) => {
-                if let Some(mksort) = self.type_info.mksorts.get(presort) {
-                    mksort(&mut self.type_info, name, args, span.clone())?
+                if let Some(mksort) = self.mksorts.get(presort) {
+                    mksort(self, name, args, span.clone())?
                 } else {
                     return Err(TypeError::PresortNotFound(presort.clone(), span));
                 }
@@ -259,10 +261,8 @@ impl EGraph {
 
     /// Add a user-defined sort to the e-graph.
     pub fn add_arcsort(&mut self, sort: ArcSort, span: Span) -> Result<(), TypeError> {
-        sort.register_type(&mut self.backend);
-
         let name = sort.name();
-        match self.type_info.sorts.entry(name.to_owned()) {
+        match self.sorts.entry(name.to_owned()) {
             HEntry::Occupied(_) => Err(TypeError::SortAlreadyBound(name.to_owned(), span)),
             HEntry::Vacant(e) => {
                 e.insert(sort.clone());
@@ -284,7 +284,7 @@ impl EGraph {
     where
         T: PurePrim + Clone,
     {
-        self.register_per_context(x, validator, PureState::valid_contexts(), |x, ctx| {
+        self.register_per_context(x, validator, PureState::valid_contexts(), |x, ctx, _| {
             Box::new(PurePrimWrapper { prim: x, ctx })
         });
     }
@@ -329,8 +329,8 @@ impl EGraph {
         T: Primitive + Clone,
         S: RegistryWrap<T> + 'static,
     {
-        let registry = self.backend.action_registry().clone();
-        self.register_per_context(x, validator, valid_ctxs, move |x, ctx| {
+        self.register_per_context(x, validator, valid_ctxs, move |x, ctx, backend| {
+            let registry = backend.action_registry().clone();
             Box::new(RegistryPrimWrapper::<T, S> {
                 prim: x,
                 registry: registry.clone(),
@@ -340,11 +340,10 @@ impl EGraph {
         });
     }
 
-    /// Shared registration engine. Stores one primitive definition, plus
-    /// one runtime id per valid [`Context`]. Each wrapper carries its
-    /// specific context stamped onto the state wrapper at invoke time.
+    /// Record a definition and a backend installer. Installation allocates one
+    /// runtime entry point per valid context, carrying that call-site context.
     ///
-    /// The typechecker filters by the context-id mask at each call site;
+    /// The typechecker filters by the declared context mask at each call site;
     /// an `unstable-fn` value built around the primitive bakes *all*
     /// signature-matching context ids, and `FunctionContainer::apply`
     /// picks the one whose context matches the application ctx — so
@@ -354,63 +353,75 @@ impl EGraph {
         x: T,
         validator: Option<PrimitiveValidator>,
         valid_ctxs: &[Context],
-        mut build_wrapper: F,
+        build_wrapper: F,
     ) where
         T: Primitive + Clone,
-        F: FnMut(T, Context) -> Box<dyn ExternalFunction>,
+        F: Fn(T, Context, &egglog_bridge::EGraph) -> Box<dyn ExternalFunction>
+            + Send
+            + Sync
+            + 'static,
     {
         let primitive: Arc<dyn Primitive> = Arc::new(x.clone());
         let name = primitive.name().to_owned();
-        let context_ids = EnumMap::from_fn(|ctx| {
-            valid_ctxs.contains(&ctx).then(|| {
-                self.backend
-                    .register_external_func(build_wrapper(x.clone(), ctx))
+        let valid_contexts = valid_ctxs.to_vec();
+        let contexts = valid_contexts.clone();
+        let install = Arc::new(move |backend: &mut egglog_bridge::EGraph| {
+            EnumMap::from_fn(|ctx| {
+                contexts.contains(&ctx).then(|| {
+                    let wrapper = build_wrapper(x.clone(), ctx, backend);
+                    backend.register_external_func(wrapper)
+                })
             })
         });
-        self.type_info
-            .primitives
-            .entry(name)
-            .or_default()
-            .push(PrimitiveWithId {
-                primitive,
-                validator,
-                context_ids,
-            });
+        let entries = self.primitives.entry(name).or_default();
+        let pending = entries
+            .iter()
+            .position(|definition| definition.install.is_none());
+        let id = pending
+            .map(|index| entries.remove(index).id)
+            .unwrap_or_else(next_primitive_id);
+        entries.push(PrimitiveDefinition {
+            primitive,
+            validator,
+            valid_contexts,
+            install: Some(install),
+            id,
+        });
     }
 }
 
-impl EGraph {
-    pub(crate) fn typecheck_program(
+impl TypeInfo {
+    pub fn typecheck_program(
         &mut self,
-        program: &Vec<NCommand>,
+        symbol_gen: &mut SymbolGen,
+        program: &[NCommand],
     ) -> Result<Vec<ResolvedNCommand>, TypeError> {
         let mut result = vec![];
         for command in program {
-            result.push(self.typecheck_command(command)?);
+            result.push(self.typecheck_command(symbol_gen, command)?);
         }
         Ok(result)
     }
 
-    fn typecheck_command(&mut self, command: &NCommand) -> Result<ResolvedNCommand, TypeError> {
-        let symbol_gen = &mut self.parser.symbol_gen;
-
+    pub fn typecheck_command(
+        &mut self,
+        symbol_gen: &mut SymbolGen,
+        command: &NCommand,
+    ) -> Result<ResolvedNCommand, TypeError> {
         let command: ResolvedNCommand = match command {
             NCommand::Function(fdecl) => {
-                let resolved = self.type_info.typecheck_function(symbol_gen, fdecl)?;
+                let resolved = self.typecheck_function(symbol_gen, fdecl)?;
                 // If this is a let binding, add it to global_sorts
                 // This preserves bahavior for lets after desugaring
                 if resolved.internal_let {
-                    let output_sort = self.type_info.sorts.get(&fdecl.schema.output).unwrap();
-                    self.type_info
-                        .global_sorts
+                    let output_sort = self.sorts.get(&fdecl.schema.output).unwrap();
+                    self.global_sorts
                         .insert(fdecl.name.clone(), output_sort.clone());
                 }
                 ResolvedNCommand::Function(resolved)
             }
             NCommand::NormRule { rule } => ResolvedNCommand::NormRule {
-                rule: self
-                    .type_info
-                    .typecheck_rule(symbol_gen, rule, self.seminaive)?,
+                rule: self.typecheck_rule(symbol_gen, rule)?,
             },
             NCommand::Sort {
                 span,
@@ -427,8 +438,182 @@ impl EGraph {
                 self.declare_sort(name.clone(), presort_and_args, span.clone())?;
                 // Mark as non-unionable if the sort declaration says so
                 if !unionable {
-                    self.type_info.non_unionable_sorts.insert(name.clone());
+                    self.non_unionable_sorts.insert(name.clone());
                 }
+                ResolvedNCommand::Sort {
+                    span: span.clone(),
+                    name: name.clone(),
+                    presort_and_args: presort_and_args.clone(),
+                    uf: uf.clone(),
+                    proof_func: proof_func.clone(),
+                    container_rebuild: container_rebuild.clone(),
+                    proof_constructors: proof_constructors.clone(),
+                    unionable: *unionable,
+                }
+            }
+            NCommand::CoreAction(action @ Action::Let(_, _, _)) => {
+                let action = self.typecheck_standalone_action(
+                    symbol_gen,
+                    action,
+                    &Default::default(),
+                    Context::Full,
+                )?;
+                let ResolvedAction::Let(_, resolved_var, _) = &action else {
+                    unreachable!("typechecking an Action::Let should return ResolvedAction::Let")
+                };
+                self.global_sorts
+                    .insert(resolved_var.name.clone(), resolved_var.sort.clone());
+                ResolvedNCommand::CoreAction(action)
+            }
+            NCommand::CoreAction(action) => {
+                ResolvedNCommand::CoreAction(self.typecheck_standalone_action(
+                    symbol_gen,
+                    action,
+                    &Default::default(),
+                    Context::Full,
+                )?)
+            }
+            NCommand::Extract(span, expr, variants) => {
+                let res_expr = self.typecheck_standalone_expr(
+                    symbol_gen,
+                    expr,
+                    &Default::default(),
+                    Context::Full,
+                )?;
+
+                let res_variants = self.typecheck_standalone_expr(
+                    symbol_gen,
+                    variants,
+                    &Default::default(),
+                    Context::Full,
+                )?;
+                if res_variants.output_type().name() != I64Sort.name() {
+                    return Err(TypeError::Mismatch {
+                        expr: variants.clone(),
+                        expected: I64Sort.to_arcsort(),
+                        actual: res_variants.output_type(),
+                    });
+                }
+
+                ResolvedNCommand::Extract(span.clone(), res_expr, res_variants)
+            }
+            NCommand::Check(span, facts) => {
+                ResolvedNCommand::Check(span.clone(), self.typecheck_facts(symbol_gen, facts)?)
+            }
+            NCommand::Fail(span, cmd) => ResolvedNCommand::Fail(
+                span.clone(),
+                Box::new(self.typecheck_command(symbol_gen, cmd)?),
+            ),
+            NCommand::RunSchedule(schedule) => {
+                ResolvedNCommand::RunSchedule(self.typecheck_schedule(symbol_gen, schedule)?)
+            }
+            NCommand::Pop(span, n) => ResolvedNCommand::Pop(span.clone(), *n),
+            NCommand::Push(n) => ResolvedNCommand::Push(*n),
+            NCommand::AddRuleset(span, ruleset) => {
+                ResolvedNCommand::AddRuleset(span.clone(), ruleset.clone())
+            }
+            NCommand::UnstableCombinedRuleset(span, name, sub_rulesets) => {
+                ResolvedNCommand::UnstableCombinedRuleset(
+                    span.clone(),
+                    name.clone(),
+                    sub_rulesets.clone(),
+                )
+            }
+            NCommand::PrintOverallStatistics(span, file) => {
+                ResolvedNCommand::PrintOverallStatistics(span.clone(), file.clone())
+            }
+            NCommand::PrintFunction(span, table, size, file, mode) => {
+                ResolvedNCommand::PrintFunction(
+                    span.clone(),
+                    table.clone(),
+                    *size,
+                    file.clone(),
+                    *mode,
+                )
+            }
+            NCommand::PrintSize(span, n) => {
+                // Should probably also resolve the function symbol here
+                ResolvedNCommand::PrintSize(span.clone(), n.clone())
+            }
+            NCommand::ProveExists(span, constructor) => {
+                let func_type = self
+                    .get_func_type(constructor)
+                    .ok_or_else(|| TypeError::UnboundFunction(constructor.clone(), span.clone()))?;
+                if func_type.subtype != FunctionSubtype::Constructor {
+                    return Err(TypeError::ProveExistsRequiresConstructor(
+                        constructor.clone(),
+                        span.clone(),
+                    ));
+                }
+                ResolvedNCommand::ProveExists(span.clone(), ResolvedCall::Func(func_type.clone()))
+            }
+            NCommand::Output { span, file, exprs } => {
+                let exprs = exprs
+                    .iter()
+                    .map(|expr| {
+                        self.typecheck_standalone_expr(
+                            symbol_gen,
+                            expr,
+                            &Default::default(),
+                            Context::Full,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                ResolvedNCommand::Output {
+                    span: span.clone(),
+                    file: file.clone(),
+                    exprs,
+                }
+            }
+            NCommand::Input { span, name, file } => ResolvedNCommand::Input {
+                span: span.clone(),
+                name: name.clone(),
+                file: file.clone(),
+            },
+            NCommand::UserDefined(span, name, exprs) => {
+                ResolvedNCommand::UserDefined(span.clone(), name.clone(), exprs.clone())
+            }
+        };
+        Ok(command)
+    }
+}
+
+impl EGraph {
+    pub(crate) fn typecheck_program(
+        &mut self,
+        program: &[NCommand],
+    ) -> Result<Vec<ResolvedNCommand>, TypeError> {
+        let mut result = Vec::new();
+        for command in program {
+            if let NCommand::CoreAction(Action::Let(span, var, _)) = command {
+                self.ensure_global_name_prefix(span, var)?;
+            }
+            if let Some(expanded) =
+                crate::macros::check_deferred(&mut self.type_info, &mut self.parser, command)
+                    .map_err(|error| TypeError::MacroExpansion(error.to_string()))?
+            {
+                self.install_type_info();
+                for command in expanded {
+                    if let ResolvedNCommand::NormRule { rule } = &command {
+                        self.warn_for_prefixed_non_globals_in_rule(rule)?;
+                    }
+                    result.push(self.bind_command_primitives(command));
+                }
+                continue;
+            }
+            let resolved = self
+                .type_info
+                .typecheck_command(&mut self.parser.symbol_gen, command)?;
+            self.install_type_info();
+            if let NCommand::Sort {
+                name,
+                uf,
+                proof_func,
+                proof_constructors,
+                container_rebuild,
+                ..
+            } = command
+            {
                 // Record this sort's UF / proof tables in proof_state (as
                 // run_command also does) so the container rebuild registration
                 // below can recover them — including this container's own proof
@@ -466,147 +651,13 @@ impl EGraph {
                 if let Some(spec) = container_rebuild {
                     register_container_rebuild_from_spec(self, name, spec);
                 }
-                ResolvedNCommand::Sort {
-                    span: span.clone(),
-                    name: name.clone(),
-                    presort_and_args: presort_and_args.clone(),
-                    uf: uf.clone(),
-                    proof_func: proof_func.clone(),
-                    container_rebuild: container_rebuild.clone(),
-                    proof_constructors: proof_constructors.clone(),
-                    unionable: *unionable,
-                }
             }
-            NCommand::CoreAction(action @ Action::Let(span, var, _)) => {
-                let action = self.type_info.typecheck_standalone_action(
-                    symbol_gen,
-                    action,
-                    &Default::default(),
-                    Context::Full,
-                )?;
-                self.ensure_global_name_prefix(span, var)?;
-                let ResolvedAction::Let(_, resolved_var, _) = &action else {
-                    unreachable!("typechecking an Action::Let should return ResolvedAction::Let")
-                };
-                self.type_info
-                    .global_sorts
-                    .insert(resolved_var.name.clone(), resolved_var.sort.clone());
-                ResolvedNCommand::CoreAction(action)
+            if let ResolvedNCommand::NormRule { rule } = &resolved {
+                self.warn_for_prefixed_non_globals_in_rule(rule)?;
             }
-            NCommand::CoreAction(action) => {
-                ResolvedNCommand::CoreAction(self.type_info.typecheck_standalone_action(
-                    symbol_gen,
-                    action,
-                    &Default::default(),
-                    Context::Full,
-                )?)
-            }
-            NCommand::Extract(span, expr, variants) => {
-                let res_expr = self.type_info.typecheck_standalone_expr(
-                    symbol_gen,
-                    expr,
-                    &Default::default(),
-                    Context::Full,
-                )?;
-
-                let res_variants = self.type_info.typecheck_standalone_expr(
-                    symbol_gen,
-                    variants,
-                    &Default::default(),
-                    Context::Full,
-                )?;
-                if res_variants.output_type().name() != I64Sort.name() {
-                    return Err(TypeError::Mismatch {
-                        expr: variants.clone(),
-                        expected: I64Sort.to_arcsort(),
-                        actual: res_variants.output_type(),
-                    });
-                }
-
-                ResolvedNCommand::Extract(span.clone(), res_expr, res_variants)
-            }
-            NCommand::Check(span, facts) => ResolvedNCommand::Check(
-                span.clone(),
-                self.type_info.typecheck_facts(symbol_gen, facts)?,
-            ),
-            NCommand::Fail(span, cmd) => {
-                ResolvedNCommand::Fail(span.clone(), Box::new(self.typecheck_command(cmd)?))
-            }
-            NCommand::RunSchedule(schedule) => ResolvedNCommand::RunSchedule(
-                self.type_info.typecheck_schedule(symbol_gen, schedule)?,
-            ),
-            NCommand::Pop(span, n) => ResolvedNCommand::Pop(span.clone(), *n),
-            NCommand::Push(n) => ResolvedNCommand::Push(*n),
-            NCommand::AddRuleset(span, ruleset) => {
-                ResolvedNCommand::AddRuleset(span.clone(), ruleset.clone())
-            }
-            NCommand::UnstableCombinedRuleset(span, name, sub_rulesets) => {
-                ResolvedNCommand::UnstableCombinedRuleset(
-                    span.clone(),
-                    name.clone(),
-                    sub_rulesets.clone(),
-                )
-            }
-            NCommand::PrintOverallStatistics(span, file) => {
-                ResolvedNCommand::PrintOverallStatistics(span.clone(), file.clone())
-            }
-            NCommand::PrintFunction(span, table, size, file, mode) => {
-                ResolvedNCommand::PrintFunction(
-                    span.clone(),
-                    table.clone(),
-                    *size,
-                    file.clone(),
-                    *mode,
-                )
-            }
-            NCommand::PrintSize(span, n) => {
-                // Should probably also resolve the function symbol here
-                ResolvedNCommand::PrintSize(span.clone(), n.clone())
-            }
-            NCommand::ProveExists(span, constructor) => {
-                let func_type = self
-                    .type_info
-                    .get_func_type(constructor)
-                    .ok_or_else(|| TypeError::UnboundFunction(constructor.clone(), span.clone()))?;
-                if func_type.subtype != FunctionSubtype::Constructor {
-                    return Err(TypeError::ProveExistsRequiresConstructor(
-                        constructor.clone(),
-                        span.clone(),
-                    ));
-                }
-                ResolvedNCommand::ProveExists(span.clone(), ResolvedCall::Func(func_type.clone()))
-            }
-            NCommand::Output { span, file, exprs } => {
-                let exprs = exprs
-                    .iter()
-                    .map(|expr| {
-                        self.type_info.typecheck_standalone_expr(
-                            symbol_gen,
-                            expr,
-                            &Default::default(),
-                            Context::Full,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                ResolvedNCommand::Output {
-                    span: span.clone(),
-                    file: file.clone(),
-                    exprs,
-                }
-            }
-            NCommand::Input { span, name, file } => ResolvedNCommand::Input {
-                span: span.clone(),
-                name: name.clone(),
-                file: file.clone(),
-            },
-            NCommand::UserDefined(span, name, exprs) => {
-                ResolvedNCommand::UserDefined(span.clone(), name.clone(), exprs.clone())
-            }
-        };
-        if let ResolvedNCommand::NormRule { rule } = &command {
-            self.warn_for_prefixed_non_globals_in_rule(rule)?;
+            result.push(self.bind_command_primitives(resolved));
         }
-        Ok(command)
+        Ok(result)
     }
 
     fn warn_for_prefixed_non_globals_in_var(
@@ -872,11 +923,10 @@ impl TypeInfo {
         Result::Ok(schedule)
     }
 
-    fn typecheck_rule(
+    pub fn typecheck_rule(
         &self,
         symbol_gen: &mut SymbolGen,
         rule: &Rule,
-        global_seminaive: bool,
     ) -> Result<ResolvedRule, TypeError> {
         let Rule {
             span,
@@ -891,16 +941,8 @@ impl TypeInfo {
         // Compile with the permissive Read/Full primitive contexts (so the RHS
         // can read the database) when the whole EGraph is non-seminaive, or the
         // rule's own mode requires it (`:naive` / `:unsafe-seminaive`).
-        let read_contexts = !global_seminaive
-            || matches!(
-                eval_mode,
-                RuleEvalMode::Naive | RuleEvalMode::UnsafeSeminaive
-            );
-        let (query_ctx, action_ctx) = if read_contexts {
-            (Context::Read, Context::Full)
-        } else {
-            (Context::Pure, Context::Write)
-        };
+        let (query_ctx, action_ctx) = self.rule_contexts(*eval_mode);
+        let read_contexts = action_ctx == Context::Full;
 
         let (query, mapped_query) = Facts(body.clone()).to_query(self, symbol_gen);
         let mut problem = Problem::default();
@@ -949,7 +991,7 @@ impl TypeInfo {
         Ok(())
     }
 
-    fn check_no_function_lookups_in_actions(
+    pub(crate) fn check_no_function_lookups_in_actions(
         &self,
         actions: &ResolvedActions,
     ) -> Result<(), TypeError> {
@@ -998,7 +1040,7 @@ impl TypeInfo {
     // Standalone expressions/actions use action lowering. Top-level commands
     // pass `Full`; function `:merge` reuses this path with `Write` because
     // merge expressions run during table updates.
-    fn typecheck_standalone_actions(
+    pub(crate) fn typecheck_standalone_actions(
         &self,
         symbol_gen: &mut SymbolGen,
         actions: &Actions,
@@ -1028,7 +1070,7 @@ impl TypeInfo {
         Ok(annotated_actions)
     }
 
-    fn typecheck_standalone_expr(
+    pub fn typecheck_standalone_expr(
         &self,
         symbol_gen: &mut SymbolGen,
         expr: &Expr,
@@ -1044,7 +1086,7 @@ impl TypeInfo {
         }
     }
 
-    pub(crate) fn typecheck_expr_with_output(
+    pub fn typecheck_expr_with_output(
         &self,
         symbol_gen: &mut SymbolGen,
         expr: &Expr,
@@ -1092,7 +1134,7 @@ impl TypeInfo {
         }
     }
 
-    fn typecheck_standalone_action(
+    pub fn typecheck_standalone_action(
         &self,
         symbol_gen: &mut SymbolGen,
         action: &Action,
@@ -1115,7 +1157,7 @@ impl TypeInfo {
         self.sorts.get(sym)
     }
 
-    pub fn get_prims(&self, sym: &str) -> Option<&[PrimitiveWithId]> {
+    pub fn get_prims(&self, sym: &str) -> Option<&[PrimitiveDefinition]> {
         self.primitives.get(sym).map(Vec::as_slice)
     }
 
@@ -1123,11 +1165,12 @@ impl TypeInfo {
         self.primitives.contains_key(sym) || self.reserved_primitives.contains(sym)
     }
 
-    pub fn primitive_has_validator(&self, id: ExternalFunctionId) -> bool {
-        self.primitives
-            .values()
-            .flat_map(|v| v.iter())
-            .any(|p| p.context_ids.iter().any(|(_, pid)| *pid == Some(id)) && p.validator.is_some())
+    /// Function and constructor signatures in stable name order. This exposes
+    /// declaration metadata to macros without consulting runtime tables.
+    pub fn get_func_types(&self) -> Vec<Arc<FuncType>> {
+        let mut functions: Vec<_> = self.func_types.values().cloned().collect();
+        functions.sort_by(|a, b| a.name.cmp(&b.name));
+        functions
     }
 
     /// The shared signature declared for `sym`, or `None` if no function with
@@ -1176,6 +1219,14 @@ impl TypeInfo {
 
 #[derive(Debug, Clone, Error)]
 pub enum TypeError {
+    #[error("{0}")]
+    MacroExpansion(String),
+    #[error("{expr}: expected {description}, got {}", .actual.name())]
+    SortPredicate {
+        expr: Expr,
+        description: String,
+        actual: ArcSort,
+    },
     #[error("{}\nArity mismatch, expected {expected} args: {expr}", .expr.span())]
     Arity { expr: Expr, expected: usize },
     #[error(
@@ -1255,6 +1306,291 @@ pub enum TypeError {
         ctx: crate::Context,
         span: Span,
     },
+}
+
+impl Default for TypeInfo {
+    fn default() -> Self {
+        let mut eg = Self {
+            seminaive: true,
+            mksorts: Default::default(),
+            reserved_primitives: Default::default(),
+            sorts: Default::default(),
+            primitives: Default::default(),
+            func_types: Default::default(),
+            global_sorts: Default::default(),
+            non_unionable_sorts: Default::default(),
+            hidden_functions: Default::default(),
+        };
+        eg.add_base_sort(UnitSort, span!()).unwrap();
+        eg.add_base_sort(StringSort, span!()).unwrap();
+        eg.add_base_sort(BoolSort, span!()).unwrap();
+        eg.add_base_sort(I64Sort, span!()).unwrap();
+        eg.add_base_sort(F64Sort, span!()).unwrap();
+        eg.add_base_sort(BigIntSort, span!()).unwrap();
+        eg.add_base_sort(BigRatSort, span!()).unwrap();
+        eg.add_presort::<MapSort>(span!()).unwrap();
+        eg.add_presort::<SetSort>(span!()).unwrap();
+        eg.add_presort::<VecSort>(span!()).unwrap();
+        eg.add_presort::<FunctionSort>(span!()).unwrap();
+        eg.add_presort::<MultiSetSort>(span!()).unwrap();
+        eg.add_presort::<PairSort>(span!()).unwrap();
+
+        // Add != with a validator that computes inequality result
+        let neq_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+            if args.len() == 2 && args[0] != args[1] {
+                // Return unit literal for successful inequality
+                Some(termdag.lit(Literal::Unit))
+            } else {
+                None
+            }
+        };
+        add_primitive_with_validator!(
+            &mut eg,
+            "!=" = |a: #, b: #| -?> () {
+                (a != b).then_some(())
+            },
+            neq_validator
+        );
+
+        add_primitive_with_validator!(
+            &mut eg,
+            "bool-!=" = |a: #, b: #| -> bool {
+                (a != b)
+            },
+            |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+                if args.len() == 2 {
+                    Some(termdag.lit(Literal::Bool(args[0] != args[1])))
+                } else {
+                    None
+                }
+            }
+        );
+
+        add_primitive!(&mut eg, "value-eq" = |a: #, b: #| -?> () {
+            (a == b).then_some(())
+        });
+        add_primitive!(&mut eg, "ordering-min" = |a: #, b: #| -> # {
+            if a < b { a } else { b }
+        });
+        add_primitive!(&mut eg, "ordering-max" = |a: #, b: #| -> # {
+            if a > b { a } else { b }
+        });
+
+        eg
+    }
+}
+
+impl TypeInfo {
+    /// Register a base sort and its primitive signatures without allocating backend state.
+    pub fn add_base_sort(
+        &mut self,
+        sort: impl prelude::BaseSort,
+        span: Span,
+    ) -> Result<(), TypeError> {
+        self.add_arcsort(sort.to_arcsort(), span)
+    }
+
+    /// Register a container sort and its primitive signatures.
+    pub fn add_container_sort(
+        &mut self,
+        sort: impl prelude::ContainerSort,
+        span: Span,
+    ) -> Result<(), TypeError> {
+        self.add_arcsort(sort.to_arcsort(), span)
+    }
+
+    /// Access the declaration environment when using shared primitive-registration helpers.
+    pub fn type_info(&mut self) -> &mut Self {
+        self
+    }
+}
+
+impl EGraph {
+    /// Set the rule evaluation and inference policy together.
+    pub fn set_seminaive(&mut self, enabled: bool) {
+        self.type_info.seminaive = enabled;
+        if let Some(source) = &mut self.proof_state.original_typechecking {
+            source.seminaive = enabled;
+        }
+    }
+
+    pub fn with_seminaive(mut self, enabled: bool) -> Self {
+        self.set_seminaive(enabled);
+        self
+    }
+
+    pub fn seminaive(&self) -> bool {
+        self.type_info.seminaive
+    }
+
+    pub fn add_sort<S: Sort + 'static>(&mut self, sort: S, span: Span) -> Result<(), TypeError> {
+        self.add_arcsort(Arc::new(sort), span)
+    }
+
+    pub fn add_arcsort(&mut self, sort: ArcSort, span: Span) -> Result<(), TypeError> {
+        self.type_info.add_arcsort(sort, span)?;
+        self.install_type_info();
+        Ok(())
+    }
+
+    pub fn declare_sort(
+        &mut self,
+        name: impl Into<String>,
+        presort_and_args: &Option<(String, Vec<Expr>)>,
+        span: Span,
+    ) -> Result<(), TypeError> {
+        self.type_info.declare_sort(name, presort_and_args, span)?;
+        self.install_type_info();
+        Ok(())
+    }
+
+    pub fn add_pure_primitive<T: PurePrim + Clone>(
+        &mut self,
+        primitive: T,
+        validator: Option<PrimitiveValidator>,
+    ) {
+        self.type_info.add_pure_primitive(primitive, validator);
+        self.install_type_info();
+    }
+    pub fn add_read_primitive<T: ReadPrim + Clone>(
+        &mut self,
+        primitive: T,
+        validator: Option<PrimitiveValidator>,
+    ) {
+        self.type_info.add_read_primitive(primitive, validator);
+        self.install_type_info();
+    }
+    pub fn add_write_primitive<T: WritePrim + Clone>(
+        &mut self,
+        primitive: T,
+        validator: Option<PrimitiveValidator>,
+    ) {
+        self.type_info.add_write_primitive(primitive, validator);
+        self.install_type_info();
+    }
+    pub fn add_full_primitive<T: FullPrim + Clone>(
+        &mut self,
+        primitive: T,
+        validator: Option<PrimitiveValidator>,
+    ) {
+        self.type_info.add_full_primitive(primitive, validator);
+        self.install_type_info();
+    }
+
+    // Backend identities belong to this EGraph, never to TypeInfo. Cloned source
+    // environments can therefore be checked without constructing a database.
+    pub(crate) fn install_type_info(&mut self) {
+        let mut sorts: Vec<_> = self.type_info.sorts.values().collect();
+        sorts.sort_by_key(|sort| sort.name());
+        for sort in sorts {
+            if self.installed_sorts.insert(sort.name().to_owned()) {
+                sort.register_type(&mut self.backend);
+            }
+        }
+        let mut primitives: Vec<_> = self.type_info.primitives.values().flatten().collect();
+        primitives.sort_by_key(|primitive| primitive.id);
+        for primitive in primitives {
+            if let Some(install) = &primitive.install {
+                self.primitive_runtimes
+                    .entry(primitive.id)
+                    .or_insert_with(|| install(&mut self.backend));
+            }
+        }
+    }
+
+    pub(crate) fn bind_expr_primitives(&self, expr: ResolvedExpr) -> ResolvedExpr {
+        expr.visit_exprs(&mut |mut expr| {
+            if let ResolvedExpr::Call(_, ResolvedCall::Primitive(primitive), _) = &mut expr {
+                primitive.bind_runtime(&self.primitive_runtimes);
+            }
+            expr
+        })
+    }
+
+    pub(crate) fn bind_command_primitives(&self, command: ResolvedNCommand) -> ResolvedNCommand {
+        command.visit_exprs(&mut |mut expr| {
+            if let ResolvedExpr::Call(_, ResolvedCall::Primitive(primitive), _) = &mut expr {
+                primitive.bind_runtime(&self.primitive_runtimes);
+            }
+            expr
+        })
+    }
+}
+
+impl TypeInfo {
+    pub(crate) fn add_deferred(&mut self, call: impl Primitive) {
+        let name = call.name().to_owned();
+        self.primitives.insert(
+            name,
+            vec![PrimitiveDefinition {
+                primitive: Arc::new(call),
+                validator: None,
+                id: next_primitive_id(),
+                valid_contexts: vec![Context::Write, Context::Full],
+                install: None,
+            }],
+        );
+    }
+    pub(crate) fn remove_deferred(&mut self, name: &str) {
+        self.primitives.remove(name);
+    }
+}
+
+fn next_primitive_id() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl TypeInfo {
+    /// Declare a primitive's constraints before its runtime implementation is
+    /// installed. Registering that implementation completes this declaration.
+    pub fn declare_primitive(&mut self, primitive: impl Primitive, contexts: &[Context]) {
+        self.primitives
+            .entry(primitive.name().to_owned())
+            .or_default()
+            .push(PrimitiveDefinition {
+                primitive: Arc::new(primitive),
+                validator: None,
+                id: next_primitive_id(),
+                valid_contexts: contexts.to_vec(),
+                install: None,
+            });
+    }
+
+    /// Check an expression in a standalone environment, retaining the exact
+    /// overload choices and rewriting globals for subsequent evaluation.
+    pub fn typecheck_expr_with_bindings_and_output(
+        &self,
+        symbols: &mut SymbolGen,
+        expr: &Expr,
+        bindings: &[(String, Span, ArcSort)],
+        output: ArcSort,
+        context: Context,
+    ) -> Result<ResolvedExpr, TypeError> {
+        let mut scope = IndexMap::default();
+        for (name, span, sort) in bindings {
+            if scope
+                .insert(name.as_str(), (span.clone(), sort.clone()))
+                .is_some()
+            {
+                return Err(TypeError::AlreadyDefined(name.clone(), span.clone()));
+            }
+        }
+        Ok(remove_globals::remove_globals_expr(
+            self.typecheck_expr_with_output(symbols, expr, &scope, output, context)?,
+        ))
+    }
+}
+
+impl TypeInfo {
+    /// Shared inference and runtime capability policy for a rule.
+    pub fn rule_contexts(&self, mode: RuleEvalMode) -> (Context, Context) {
+        if !self.seminaive || matches!(mode, RuleEvalMode::Naive | RuleEvalMode::UnsafeSeminaive) {
+            (Context::Read, Context::Full)
+        } else {
+            (Context::Pure, Context::Write)
+        }
+    }
 }
 
 #[cfg(test)]

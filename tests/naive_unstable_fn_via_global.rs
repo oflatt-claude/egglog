@@ -135,6 +135,6 @@ fn global_naive_widens_rule_context_same_as_local_naive() {
 ";
 
     let mut egraph = EGraph::default();
-    egraph.seminaive = false;
+    egraph.set_seminaive(false);
     egraph.parse_and_run_program(None, program).unwrap();
 }

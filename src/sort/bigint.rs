@@ -11,7 +11,7 @@ impl BaseSort for BigIntSort {
     }
 
     #[rustfmt::skip]
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut TypeInfo) {
         add_primitive!(eg, "bigint" = |a: i64| -> Z { Z::new(a.into()) });
 
         add_primitive!(eg, "+" = |a: Z, b: Z| -> Z { a + b });

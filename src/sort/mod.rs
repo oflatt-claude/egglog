@@ -118,7 +118,7 @@ pub trait Sort: Any + Send + Sync + Debug {
     /// Every non-EqSort sort should return Some(TypeId).
     fn value_type(&self) -> Option<TypeId>;
 
-    fn register_primitives(self: Arc<Self>, eg: &mut EGraph) {
+    fn register_primitives(self: Arc<Self>, eg: &mut TypeInfo) {
         let _ = eg;
     }
 

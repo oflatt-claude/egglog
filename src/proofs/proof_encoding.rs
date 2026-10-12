@@ -23,10 +23,9 @@ pub(crate) struct EncodingState {
     /// has a proof witness.
     pub merge_current: HashMap<String, (String, usize)>,
     pub term_header_added: bool,
-    // TODO this is very ugly- we should separate out a typechecking struct
-    // since we didn't need an entire e-graph
-    // When Some term encoding is enabled.
-    pub original_typechecking: Option<Box<EGraph>>,
+    /// Source declarations before term/proof encoding; no second database.
+    /// `Some` enables the term-encoding pipeline.
+    pub original_typechecking: Option<TypeInfo>,
     pub proofs_enabled: bool,
     pub proof_testing: bool,
     pub proof_names: EncodingNames,
